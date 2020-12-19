@@ -995,6 +995,15 @@ impl<'a> TcpSocket<'a> {
                            self.meta.handle, self.local_endpoint, self.remote_endpoint);
                 return Err(Error::Dropped)
             }
+            // Any ACK in the SYN-SENT state must have the SYN flag set.
+            (State::SynSent, &TcpRepr {
+                control: TcpControl::None, ack_number: Some(_), ..
+            }) => {
+                net_debug!("{}:{}:{}: expecting a SYN|ACK",
+                           self.meta.handle, self.local_endpoint, self.remote_endpoint);
+                self.abort();
+                return Err(Error::Dropped)
+            }
             // Every acknowledgement must be for transmitted but unacknowledged data.
             (_, &TcpRepr { ack_number: Some(ack_number), .. }) => {
                 let unacknowledged = self.tx_buffer.len() + control_len;
@@ -1549,7 +1558,8 @@ impl<'a> TcpSocket<'a> {
                 // Extract as much data as the remote side can receive in this packet
                 // from the transmit buffer.
                 let offset = self.remote_last_seq - self.local_seq_no;
-                let size = cmp::min(self.remote_win_len, self.remote_mss);
+                let size = cmp::min(cmp::min(self.remote_win_len, self.remote_mss),
+                     caps.max_transmission_unit - ip_repr.buffer_len() - repr.mss_header_len());
                 repr.payload = self.tx_buffer.get_allocated(offset, size);
                 // If we've sent everything we had in the buffer, follow it with the PSH or FIN
                 // flags, depending on whether the transmit half of the connection is open.
@@ -1564,8 +1574,9 @@ impl<'a> TcpSocket<'a> {
                 }
             }
 
-            // We do not transmit anything in the FIN-WAIT-2 state.
-            State::FinWait2 => return Err(Error::Exhausted),
+            // We do not transmit data in the FIN-WAIT-2 state, but we may transmit
+            // ACKs for incoming data.
+            State::FinWait2 => {}
 
             // We do not transmit data or control flags in the CLOSING or TIME-WAIT states,
             // but we may retransmit an ACK.
@@ -2491,6 +2502,17 @@ mod test {
     }
 
     #[test]
+    fn test_syn_sent_bad_ack() {
+        let mut s = socket_syn_sent();
+        send!(s, TcpRepr {
+            control: TcpControl::None,
+            ack_number: Some(TcpSeqNumber(1)),
+            ..SEND_TEMPL
+        }, Err(Error::Dropped));
+        assert_eq!(s.state, State::Closed);
+    }
+
+    #[test]
     fn test_syn_sent_close() {
         let mut s = socket();
         s.close();
@@ -3072,6 +3094,11 @@ mod test {
             assert_eq!(data, b"abc");
             (3, ())
         }).unwrap();
+        recv!(s, [TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 1,
+            ack_number: Some(REMOTE_SEQ + 1 + 3),
+            ..RECV_TEMPL
+        }]);
     }
 
     #[test]
