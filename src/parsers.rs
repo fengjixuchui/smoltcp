@@ -88,11 +88,11 @@ impl<'a> Parser<'a> {
 
     fn accept_digit(&mut self, hex: bool) -> Result<u8> {
         let digit = self.advance()?;
-        if digit >= b'0' && digit <= b'9' {
+        if (b'0'..=b'9').contains(&digit) {
             Ok(digit - b'0')
-        } else if hex && digit >= b'a' && digit <= b'f' {
+        } else if hex && (b'a'..=b'f').contains(&digit) {
             Ok(digit - b'a' + 10)
-        } else if hex && digit >= b'A' && digit <= b'F' {
+        } else if hex && (b'A'..=b'F').contains(&digit) {
             Ok(digit - b'A' + 10)
         } else {
             Err(())
@@ -121,8 +121,8 @@ impl<'a> Parser<'a> {
     #[cfg(feature = "ethernet")]
     fn accept_mac_joined_with(&mut self, separator: u8) -> Result<EthernetAddress> {
         let mut octets = [0u8; 6];
-        for n in 0..6 {
-            octets[n] = self.accept_number(2, 0x100, true)? as u8;
+        for (n, octet) in octets.iter_mut().enumerate() {
+            *octet = self.accept_number(2, 0x100, true)? as u8;
             if n != 5 {
                 self.accept_char(separator)?;
             }
@@ -270,8 +270,8 @@ impl<'a> Parser<'a> {
 
     fn accept_ipv4_octets(&mut self) -> Result<[u8; 4]> {
         let mut octets = [0u8; 4];
-        for n in 0..4 {
-            octets[n] = self.accept_number(3, 0x100, false)? as u8;
+        for (n, octet) in octets.iter_mut().enumerate() {
+            *octet = self.accept_number(3, 0x100, false)? as u8;
             if n != 3 {
                 self.accept_char(b'.')?;
             }
