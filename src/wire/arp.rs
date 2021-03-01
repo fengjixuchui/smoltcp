@@ -86,6 +86,7 @@ impl<T: AsRef<[u8]>> Packet<T> {
     ///
     /// [set_hardware_len]: #method.set_hardware_len
     /// [set_protocol_len]: #method.set_protocol_len
+    #[allow(clippy::if_same_then_else)]
     pub fn check_len(&self) -> Result<()> {
         let len = self.buffer.as_ref().len();
         if len < field::OPER.end {
@@ -252,6 +253,7 @@ use crate::wire::{EthernetAddress, Ipv4Address};
 
 /// A high-level representation of an Address Resolution Protocol packet.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[non_exhaustive]
 pub enum Repr {
     /// An Ethernet and IPv4 Address Resolution Protocol packet.
     EthernetIpv4 {
@@ -261,8 +263,6 @@ pub enum Repr {
         target_hardware_addr: EthernetAddress,
         target_protocol_addr: Ipv4Address
     },
-    #[doc(hidden)]
-    __Nonexhaustive
 }
 
 impl Repr {
@@ -292,7 +292,6 @@ impl Repr {
     pub fn buffer_len(&self) -> usize {
         match *self {
             Repr::EthernetIpv4 { .. } => field::TPA(6, 4).end,
-            Repr::__Nonexhaustive => unreachable!()
         }
     }
 
@@ -314,7 +313,6 @@ impl Repr {
                 packet.set_target_hardware_addr(target_hardware_addr.as_bytes());
                 packet.set_target_protocol_addr(target_protocol_addr.as_bytes());
             },
-            Repr::__Nonexhaustive => unreachable!()
         }
     }
 }
@@ -351,7 +349,6 @@ impl fmt::Display for Repr {
                        target_hardware_addr, target_protocol_addr,
                        operation)
             },
-            Repr::__Nonexhaustive => unreachable!()
         }
     }
 }

@@ -87,13 +87,11 @@
                feature = "socket-tcp")))]
 compile_error!("at least one socket needs to be enabled"); */
 
-// FIXME(dlrobertson): clippy fails with this lint
-#![allow(clippy::if_same_then_else)]
-#![allow(clippy::manual_non_exhaustive)]
 #![allow(clippy::match_like_matches_macro)]
 #![allow(clippy::redundant_field_names)]
 #![allow(clippy::identity_op)]
 #![allow(clippy::option_map_unit_fn)]
+#![allow(clippy::unit_arg)]
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
@@ -108,6 +106,7 @@ pub mod storage;
 pub mod phy;
 pub mod wire;
 pub mod iface;
+#[cfg(feature = "socket")]
 pub mod socket;
 pub mod time;
 #[cfg(feature = "proto-dhcpv4")]
@@ -115,6 +114,7 @@ pub mod dhcp;
 
 /// The error type for the networking stack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// An operation cannot proceed because a buffer is empty or full.
     Exhausted,
@@ -147,9 +147,6 @@ pub enum Error {
     /// An incoming packet was recognized but contradicted internal state.
     /// E.g. a TCP packet addressed to a socket that doesn't exist.
     Dropped,
-
-    #[doc(hidden)]
-    __Nonexhaustive
 }
 
 /// The result type for the networking stack.
@@ -168,7 +165,6 @@ impl fmt::Display for Error {
             Error::Fragmented    => write!(f, "fragmented packet"),
             Error::Malformed     => write!(f, "malformed packet"),
             Error::Dropped       => write!(f, "dropped by socket"),
-            Error::__Nonexhaustive => unreachable!()
         }
     }
 }

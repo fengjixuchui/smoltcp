@@ -11,16 +11,19 @@ jobs:
     continue-on-error: ${{ matrix.rust == 'nightly' }}
     strategy:
       matrix:
-        # Test on stable, MSRV 1.36, and nightly.
+        # Test on stable, MSRV 1.40, and nightly.
         # Failure is permitted on nightly.
         rust:
           - stable
-          - 1.36.0
+          - 1.40.0
           - nightly
 
         features:
           # Test default features.
           - default
+
+          # Test minimal featureset
+          - std proto-ipv4
 
           # Test features chosen to be as orthogonal as possible.
           - std ethernet phy-raw_socket proto-ipv6 socket-udp
@@ -57,11 +60,11 @@ jobs:
     continue-on-error: ${{ matrix.rust == 'nightly' }}
     strategy:
       matrix:
-        # Test on stable, MSRV 1.36, and nightly.
+        # Test on stable, MSRV 1.40, and nightly.
         # Failure is permitted on nightly.
         rust:
           - stable
-          - 1.36.0
+          - 1.40.0
           - nightly
 
         features:

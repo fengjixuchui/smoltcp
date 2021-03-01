@@ -54,6 +54,99 @@ impl fmt::Display for State {
     }
 }
 
+// Conservative initial RTT estimate.
+const RTTE_INITIAL_RTT: u32 = 300;
+const RTTE_INITIAL_DEV: u32 = 100;
+
+// Minimum "safety margin" for the RTO that kicks in when the
+// variance gets very low.
+const RTTE_MIN_MARGIN: u32 = 5;
+
+const RTTE_MIN_RTO: u32 = 10;
+const RTTE_MAX_RTO: u32 = 10000;
+
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+struct RttEstimator {
+    // Using u32 instead of Duration to save space (Duration is i64)
+    rtt: u32,
+    deviation: u32,
+    timestamp: Option<(Instant, TcpSeqNumber)>,
+    max_seq_sent: Option<TcpSeqNumber>,
+    rto_count: u8,
+}
+
+impl Default for RttEstimator {
+    fn default() -> Self {
+        Self {
+            rtt: RTTE_INITIAL_RTT,
+            deviation: RTTE_INITIAL_DEV,
+            timestamp: None,
+            max_seq_sent: None,
+            rto_count: 0,
+        }
+    }
+}
+
+impl RttEstimator {
+    fn retransmission_timeout(&self) -> Duration {
+        let margin = RTTE_MIN_MARGIN.max(self.deviation * 4);
+        let ms = (self.rtt + margin).max(RTTE_MIN_RTO).min(RTTE_MAX_RTO);
+        Duration::from_millis(ms as u64)
+    }
+
+    fn sample(&mut self, new_rtt: u32) {
+        // "Congestion Avoidance and Control", Van Jacobson, Michael J. Karels, 1988
+        self.rtt = (self.rtt * 7 + new_rtt + 7) / 8;
+        let diff = (self.rtt as i32 - new_rtt as i32 ).abs() as u32;
+        self.deviation = (self.deviation * 3 + diff + 3) / 4;
+        
+        self.rto_count = 0;
+
+        let rto = self.retransmission_timeout().millis();
+        net_trace!("rtte: sample={:?} rtt={:?} dev={:?} rto={:?}", new_rtt, self.rtt, self.deviation, rto);
+    }
+
+    fn on_send(&mut self, timestamp: Instant, seq: TcpSeqNumber) {
+        if self.max_seq_sent.map(|max_seq_sent| seq > max_seq_sent).unwrap_or(true) {
+            self.max_seq_sent = Some(seq);
+            if self.timestamp.is_none() {
+                self.timestamp = Some((timestamp, seq));
+                net_trace!("rtte: sampling at seq={:?}", seq);
+            }
+        }
+    }
+
+    fn on_ack(&mut self, timestamp: Instant, seq: TcpSeqNumber) {
+        if let Some((sent_timestamp, sent_seq)) = self.timestamp {
+            if seq >= sent_seq {
+                self.sample((timestamp - sent_timestamp).millis() as u32);
+                self.timestamp = None;
+            }
+        }
+    }
+
+    fn on_retransmit(&mut self) {
+        if self.timestamp.is_some() {
+            net_trace!("rtte: abort sampling due to retransmit");
+        }
+        self.timestamp = None;
+        self.rto_count = self.rto_count.saturating_add(1);
+        if self.rto_count >= 3 {
+            // This happens in 2 scenarios:
+            // - The RTT is higher than the initial estimate
+            // - The network conditions change, suddenly making the RTT much higher
+            // In these cases, the estimator can get stuck, because it can't sample because
+            // all packets sent would incur a retransmit. To avoid this, force an estimate
+            // increase if we see 3 consecutive retransmissions without any successful sample.
+            self.rto_count = 0;
+            self.rtt *= 2;
+            let rto = self.retransmission_timeout().millis();
+            net_trace!("rtte: too many retransmissions, increasing: rtt={:?} dev={:?} rto={:?}", self.rtt, self.deviation, rto);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Timer {
     Idle {
@@ -69,7 +162,7 @@ enum Timer {
     }
 }
 
-const RETRANSMIT_DELAY: Duration = Duration { millis: 100 };
+const ACK_DELAY_DEFAULT: Duration = Duration { millis: 10 };
 const CLOSE_DELAY:      Duration = Duration { millis: 10_000 };
 
 impl Default for Timer {
@@ -140,12 +233,12 @@ impl Timer {
         }
     }
 
-    fn set_for_retransmit(&mut self, timestamp: Instant) {
+    fn set_for_retransmit(&mut self, timestamp: Instant, delay: Duration) {
         match *self {
             Timer::Idle { .. } | Timer::FastRetransmit { .. } => {
                 *self = Timer::Retransmit {
-                    expires_at: timestamp + RETRANSMIT_DELAY,
-                    delay:      RETRANSMIT_DELAY,
+                    expires_at: timestamp + delay,
+                    delay:      delay,
                 }
             }
             Timer::Retransmit { expires_at, delay }
@@ -189,6 +282,7 @@ pub struct TcpSocket<'a> {
     pub(crate) meta: SocketMeta,
     state:           State,
     timer:           Timer,
+    rtte:            RttEstimator,
     assembler:       Assembler,
     rx_buffer:       SocketBuffer<'a>,
     rx_fin_received: bool,
@@ -248,6 +342,12 @@ pub struct TcpSocket<'a> {
     /// each other which have the same ACK number.
     local_rx_dup_acks: u8,
 
+    /// Duration for Delayed ACK. If None no ACKs will be delayed.
+    ack_delay:       Option<Duration>,
+    /// Delayed ack timer. If set, packets containing exclusively
+    /// ACK or window updates (ie, no data) won't be sent until expiry.
+    ack_delay_until: Option<Instant>,
+
     #[cfg(feature = "async")]
     rx_waker: WakerRegistration,
     #[cfg(feature = "async")]
@@ -279,6 +379,7 @@ impl<'a> TcpSocket<'a> {
             meta:            SocketMeta::default(),
             state:           State::Closed,
             timer:           Timer::default(),
+            rtte:            RttEstimator::default(),
             assembler:       Assembler::new(rx_buffer.capacity()),
             tx_buffer:       tx_buffer,
             rx_buffer:       rx_buffer,
@@ -303,6 +404,8 @@ impl<'a> TcpSocket<'a> {
             local_rx_last_ack: None,
             local_rx_last_seq: None,
             local_rx_dup_acks: 0,
+            ack_delay:       Some(ACK_DELAY_DEFAULT),
+            ack_delay_until: None,
 
             #[cfg(feature = "async")]
             rx_waker: WakerRegistration::new(),
@@ -359,6 +462,13 @@ impl<'a> TcpSocket<'a> {
         self.timeout
     }
 
+    /// Return the ACK delay duration.
+    ///
+    /// See also the [set_ack_delay](#method.set_ack_delay) method.
+    pub fn ack_delay(&self) -> Option<Duration> {
+        self.ack_delay
+    }
+
     /// Return the current window field value, including scaling according to RFC 1323.
     ///
     /// Used in internal calculations as well as packet generation.
@@ -382,6 +492,13 @@ impl<'a> TcpSocket<'a> {
     ///     the specified duration between any two packets it sends.
     pub fn set_timeout(&mut self, duration: Option<Duration>) {
         self.timeout = duration
+    }
+
+    /// Set the ACK delay duration.
+    ///
+    /// By default, the ACK delay is set to 10ms.
+    pub fn set_ack_delay(&mut self, duration: Option<Duration>) {
+        self.ack_delay = duration
     }
 
     /// Return the keep-alive interval.
@@ -463,6 +580,7 @@ impl<'a> TcpSocket<'a> {
 
         self.state           = State::Closed;
         self.timer           = Timer::default();
+        self.rtte            = RttEstimator::default();
         self.assembler       = Assembler::new(self.rx_buffer.capacity());
         self.tx_buffer.clear();
         self.rx_buffer.clear();
@@ -483,6 +601,8 @@ impl<'a> TcpSocket<'a> {
         self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
         self.remote_mss      = DEFAULT_MSS;
         self.remote_last_ts  = None;
+        self.ack_delay       = Some(ACK_DELAY_DEFAULT);
+        self.ack_delay_until = None;
 
         #[cfg(feature = "async")]
         {
@@ -1154,6 +1274,8 @@ impl<'a> TcpSocket<'a> {
                                self.meta.handle, self.local_endpoint, self.remote_endpoint);
                     ack_of_fin = true;
                 }
+
+                self.rtte.on_ack(timestamp, ack_number);
             }
         }
 
@@ -1444,6 +1566,30 @@ impl<'a> TcpSocket<'a> {
                        self.assembler);
         }
 
+        // Handle delayed acks
+        if let Some(ack_delay) = self.ack_delay {
+            if self.ack_to_transmit() || self.window_to_update() {
+                self.ack_delay_until = match self.ack_delay_until {
+                    None => {
+                        net_trace!("{}:{}:{}: starting delayed ack timer",
+                            self.meta.handle, self.local_endpoint, self.remote_endpoint
+                        );
+
+                        Some(timestamp + ack_delay)
+                    }
+                    // RFC1122 says "in a stream of full-sized segments there SHOULD be an ACK
+                    // for at least every second segment".
+                    // For now, we send an ACK every second received packet, full-sized or not.
+                    Some(_) => {
+                        net_trace!("{}:{}:{}: delayed ack timer already started, forcing expiry",
+                            self.meta.handle, self.local_endpoint, self.remote_endpoint
+                        );
+                        None
+                    }
+                };
+            }
+        }
+
         // Per RFC 5681, we should send an immediate ACK when either:
         //  1) an out-of-order segment is received, or
         //  2) a segment arrives that fills in all or part of a gap in sequence space.
@@ -1493,6 +1639,13 @@ impl<'a> TcpSocket<'a> {
         can_data || can_fin
     }
 
+    fn delayed_ack_expired(&self, timestamp: Instant) -> bool {
+        match self.ack_delay_until {
+            None => true,
+            Some(t) => t <= timestamp,
+        }
+    }
+
     fn ack_to_transmit(&self) -> bool {
         if let Some(remote_last_ack) = self.remote_last_ack {
             remote_last_ack < self.remote_seq_no + self.rx_buffer.len()
@@ -1538,6 +1691,7 @@ impl<'a> TcpSocket<'a> {
                            self.meta.handle, self.local_endpoint, self.remote_endpoint,
                            retransmit_delta);
                 self.remote_last_seq = self.local_seq_no;
+                self.rtte.on_retransmit();
             }
         }
 
@@ -1546,11 +1700,11 @@ impl<'a> TcpSocket<'a> {
             // If we have data to transmit and it fits into partner's window, do it.
             net_trace!("{}:{}:{}: outgoing segment will send data or flags",
                        self.meta.handle, self.local_endpoint, self.remote_endpoint);
-        } else if self.ack_to_transmit() {
+        } else if self.ack_to_transmit() && self.delayed_ack_expired(timestamp) {
             // If we have data to acknowledge, do it.
             net_trace!("{}:{}:{}: outgoing segment will acknowledge",
                        self.meta.handle, self.local_endpoint, self.remote_endpoint);
-        } else if self.window_to_update() {
+        } else if self.window_to_update() && self.delayed_ack_expired(timestamp) {
             // If we have window length increase to advertise, do it.
             net_trace!("{}:{}:{}: outgoing segment will update window",
                        self.meta.handle, self.local_endpoint, self.remote_endpoint);
@@ -1714,6 +1868,15 @@ impl<'a> TcpSocket<'a> {
         // the keep-alive timer.
         self.timer.rewind_keep_alive(timestamp, self.keep_alive);
 
+        // Reset delayed-ack timer
+        if self.ack_delay_until.is_some() {
+            net_trace!("{}:{}:{}: stop delayed ack timer",
+                self.meta.handle, self.local_endpoint, self.remote_endpoint
+            );
+
+            self.ack_delay_until = None;
+        }
+
         // Leave the rest of the state intact if sending a keep-alive packet, since those
         // carry a fake segment.
         if is_keep_alive { return Ok(()) }
@@ -1723,10 +1886,14 @@ impl<'a> TcpSocket<'a> {
         self.remote_last_ack = repr.ack_number;
         self.remote_last_win = repr.window_len;
 
+        if repr.segment_len() > 0 {
+            self.rtte.on_send(timestamp, repr.seq_number + repr.segment_len());
+        }
+
         if !self.seq_to_transmit() && repr.segment_len() > 0 {
             // If we've transmitted all data we could (and there was something at all,
             // data or flag, to transmit, not just an ACK), wind up the retransmit timer.
-            self.timer.set_for_retransmit(timestamp);
+            self.timer.set_for_retransmit(timestamp, self.rtte.retransmission_timeout());
         }
 
         if self.state == State::Closed {
@@ -1738,6 +1905,7 @@ impl<'a> TcpSocket<'a> {
         Ok(())
     }
 
+    #[allow(clippy::if_same_then_else)]
     pub(crate) fn poll_at(&self) -> PollAt {
         // The logic here mirrors the beginning of dispatch() closely.
         if !self.remote_endpoint.is_specified() {
@@ -1749,10 +1917,17 @@ impl<'a> TcpSocket<'a> {
         } else if self.state == State::Closed {
             // Socket was aborted, we have an RST packet to transmit.
             PollAt::Now
-        } else if self.seq_to_transmit() || self.ack_to_transmit() || self.window_to_update() {
+        } else if self.seq_to_transmit() {
             // We have a data or flag packet to transmit.
             PollAt::Now
         } else {
+            let want_ack = self.ack_to_transmit() || self.window_to_update();
+            let delayed_ack_poll_at = match (want_ack, self.ack_delay_until) {
+                (false, _) => PollAt::Ingress,
+                (true, None) => PollAt::Now,
+                (true, Some(t)) => PollAt::Time(t),
+            };
+
             let timeout_poll_at = match (self.remote_last_ts, self.timeout) {
                 // If we're transmitting or retransmitting data, we need to poll at the moment
                 // when the timeout would expire.
@@ -1762,16 +1937,15 @@ impl<'a> TcpSocket<'a> {
             };
 
             // We wait for the earliest of our timers to fire.
-            *[self.timer.poll_at(), timeout_poll_at]
+            *[self.timer.poll_at(), timeout_poll_at, delayed_ack_poll_at]
                 .iter()
-                .filter(|x| !x.is_ingress())
                 .min().unwrap_or(&PollAt::Ingress)
         }
     }
 }
 
-impl<'a, 'b> Into<Socket<'a, 'b>> for TcpSocket<'a> {
-    fn into(self) -> Socket<'a, 'b> {
+impl<'a> Into<Socket<'a>> for TcpSocket<'a> {
+    fn into(self) -> Socket<'a> {
         Socket::Tcp(self)
     }
 }
@@ -1870,8 +2044,10 @@ mod test {
 
     fn recv<F>(socket: &mut TcpSocket, timestamp: Instant, mut f: F)
             where F: FnMut(Result<TcpRepr>) {
-        let mut caps = DeviceCapabilities::default();
-        caps.max_transmission_unit = 1520;
+        let caps = DeviceCapabilities {
+            max_transmission_unit: 1520,
+            ..Default::default()
+        };
         let result = socket.dispatch(timestamp, &caps, |(ip_repr, tcp_repr)| {
             let ip_repr = ip_repr.lower(&[IpCidr::new(LOCAL_END.addr, 24)]).unwrap();
 
@@ -1972,7 +2148,9 @@ mod test {
 
         let rx_buffer = SocketBuffer::new(vec![0; rx_len]);
         let tx_buffer = SocketBuffer::new(vec![0; tx_len]);
-        TcpSocket::new(rx_buffer, tx_buffer)
+        let mut socket = TcpSocket::new(rx_buffer, tx_buffer);
+        socket.set_ack_delay(None);
+        socket
     }
 
     fn socket_syn_received_with_buffer_sizes(
@@ -3646,7 +3824,7 @@ mod test {
             ..RECV_TEMPL
         }));
         recv!(s, time 1050, Err(Error::Exhausted));
-        recv!(s, time 1100, Ok(TcpRepr {
+        recv!(s, time 2000, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
             payload:    &b"abcdef"[..],
@@ -3678,21 +3856,21 @@ mod test {
 
         recv!(s, time 50, Err(Error::Exhausted));
 
-        recv!(s, time 100, Ok(TcpRepr {
+        recv!(s, time 1000, Ok(TcpRepr {
             control:    TcpControl::None,
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
             payload:    &b"abcdef"[..],
             ..RECV_TEMPL
         }), exact);
-        recv!(s, time 150, Ok(TcpRepr {
+        recv!(s, time 1500, Ok(TcpRepr {
             control:    TcpControl::Psh,
             seq_number: LOCAL_SEQ + 1 + 6,
             ack_number: Some(REMOTE_SEQ + 1),
             payload:    &b"012345"[..],
             ..RECV_TEMPL
         }), exact);
-        recv!(s, time 200, Err(Error::Exhausted));
+        recv!(s, time 1550, Err(Error::Exhausted));
     }
 
     #[test]
@@ -3705,7 +3883,7 @@ mod test {
             max_seg_size: Some(BASE_MSS),
             ..RECV_TEMPL
         }));
-        recv!(s, time 150, Ok(TcpRepr { // retransmit
+        recv!(s, time 750, Ok(TcpRepr { // retransmit
             control:    TcpControl::Syn,
             seq_number: LOCAL_SEQ,
             ack_number: Some(REMOTE_SEQ + 1),
@@ -4527,9 +4705,9 @@ mod test {
     #[test]
     fn test_established_timeout() {
         let mut s = socket_established();
-        s.set_timeout(Some(Duration::from_millis(200)));
+        s.set_timeout(Some(Duration::from_millis(1000)));
         recv!(s, time 250, Err(Error::Exhausted));
-        assert_eq!(s.poll_at(), PollAt::Time(Instant::from_millis(450)));
+        assert_eq!(s.poll_at(), PollAt::Time(Instant::from_millis(1250)));
         s.send_slice(b"abcdef").unwrap();
         assert_eq!(s.poll_at(), PollAt::Now);
         recv!(s, time 255, Ok(TcpRepr {
@@ -4538,15 +4716,15 @@ mod test {
             payload:    &b"abcdef"[..],
             ..RECV_TEMPL
         }));
-        assert_eq!(s.poll_at(), PollAt::Time(Instant::from_millis(355)));
-        recv!(s, time 355, Ok(TcpRepr {
+        assert_eq!(s.poll_at(), PollAt::Time(Instant::from_millis(955)));
+        recv!(s, time 955, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
             payload:    &b"abcdef"[..],
             ..RECV_TEMPL
         }));
-        assert_eq!(s.poll_at(), PollAt::Time(Instant::from_millis(455)));
-        recv!(s, time 500, Ok(TcpRepr {
+        assert_eq!(s.poll_at(), PollAt::Time(Instant::from_millis(1255)));
+        recv!(s, time 1255, Ok(TcpRepr {
             control:    TcpControl::Rst,
             seq_number: LOCAL_SEQ + 1 + 6,
             ack_number: Some(REMOTE_SEQ + 1),
@@ -4596,15 +4774,14 @@ mod test {
     #[test]
     fn test_fin_wait_1_timeout() {
         let mut s = socket_fin_wait_1();
-        s.set_timeout(Some(Duration::from_millis(200)));
+        s.set_timeout(Some(Duration::from_millis(1000)));
         recv!(s, time 100, Ok(TcpRepr {
             control:    TcpControl::Fin,
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
             ..RECV_TEMPL
         }));
-        assert_eq!(s.poll_at(), PollAt::Time(Instant::from_millis(200)));
-        recv!(s, time 400, Ok(TcpRepr {
+        recv!(s, time 1100, Ok(TcpRepr {
             control:    TcpControl::Rst,
             seq_number: LOCAL_SEQ + 1 + 1,
             ack_number: Some(REMOTE_SEQ + 1),
@@ -4616,15 +4793,14 @@ mod test {
     #[test]
     fn test_last_ack_timeout() {
         let mut s = socket_last_ack();
-        s.set_timeout(Some(Duration::from_millis(200)));
+        s.set_timeout(Some(Duration::from_millis(1000)));
         recv!(s, time 100, Ok(TcpRepr {
             control:    TcpControl::Fin,
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1 + 1),
             ..RECV_TEMPL
         }));
-        assert_eq!(s.poll_at(), PollAt::Time(Instant::from_millis(200)));
-        recv!(s, time 400, Ok(TcpRepr {
+        recv!(s, time 1100, Ok(TcpRepr {
             control:    TcpControl::Rst,
             seq_number: LOCAL_SEQ + 1 + 1,
             ack_number: Some(REMOTE_SEQ + 1 + 1),
@@ -4721,8 +4897,10 @@ mod test {
     #[test]
     fn test_set_hop_limit() {
         let mut s = socket_syn_received();
-        let mut caps = DeviceCapabilities::default();
-        caps.max_transmission_unit = 1520;
+        let caps = DeviceCapabilities {
+            max_transmission_unit: 1520,
+            ..Default::default()
+        };
 
         s.set_hop_limit(Some(0x2a));
         assert_eq!(s.dispatch(Instant::from_millis(0), &caps, |(ip_repr, _)| {
@@ -4981,6 +5159,119 @@ mod test {
     }
 
     // =========================================================================================//
+    // Tests for delayed ACK
+    // =========================================================================================//
+
+    #[test]
+    fn test_delayed_ack() {
+        let mut s = socket_established();
+        s.set_ack_delay(Some(ACK_DELAY_DEFAULT));
+        send!(s, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload:    &b"abc"[..],
+            ..SEND_TEMPL
+        });
+
+        // No ACK is immediately sent.
+        recv!(s, Err(Error::Exhausted));
+
+        // After 10ms, it is sent.
+        recv!(s, time 11, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1 + 3),
+            window_len: 61,
+            ..RECV_TEMPL
+        }));
+    }
+
+    #[test]
+    fn test_delayed_ack_win() {
+        let mut s = socket_established();
+        s.set_ack_delay(Some(ACK_DELAY_DEFAULT));
+        send!(s, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload:    &b"abc"[..],
+            ..SEND_TEMPL
+        });
+
+        // Reading the data off the buffer should cause a window update.
+        s.recv(|data| {
+            assert_eq!(data, b"abc");
+            (3, ())
+        }).unwrap();
+
+        // However, no ACK or window update is immediately sent.
+        recv!(s, Err(Error::Exhausted));
+
+        // After 10ms, it is sent.
+        recv!(s, time 11, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1 + 3),
+            ..RECV_TEMPL
+        }));
+    }
+
+    #[test]
+    fn test_delayed_ack_reply() {
+        let mut s = socket_established();
+        s.set_ack_delay(Some(ACK_DELAY_DEFAULT));
+        send!(s, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload:    &b"abc"[..],
+            ..SEND_TEMPL
+        });
+
+        s.recv(|data| {
+            assert_eq!(data, b"abc");
+            (3, ())
+        }).unwrap();
+
+        s.send_slice(&b"xyz"[..]).unwrap();
+
+        // Writing data to the socket causes ACK to not be delayed,
+        // because it is immediately sent with the data.
+        recv!(s, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1 + 3),
+            payload:    &b"xyz"[..],
+            ..RECV_TEMPL
+        }));
+    }
+
+    #[test]
+    fn test_delayed_ack_every_second_packet() {
+        let mut s = socket_established();
+        s.set_ack_delay(Some(ACK_DELAY_DEFAULT));
+        send!(s, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload:    &b"abc"[..],
+            ..SEND_TEMPL
+        });
+
+        // No ACK is immediately sent.
+        recv!(s, Err(Error::Exhausted));
+
+        send!(s, TcpRepr {
+            seq_number: REMOTE_SEQ + 1 + 3,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload:    &b"def"[..],
+            ..SEND_TEMPL
+        });
+
+        // Every 2nd packet, ACK is sent without delay.
+        recv!(s, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1 + 6),
+            window_len: 58,
+            ..RECV_TEMPL
+        }));
+    }
+
+    // =========================================================================================//
     // Tests for packet filtering.
     // =========================================================================================//
 
@@ -5052,19 +5343,39 @@ mod test {
 
     #[test]
     fn test_timer_retransmit() {
+        const RTO: Duration = Duration::from_millis(100);
         let mut r = Timer::default();
         assert_eq!(r.should_retransmit(Instant::from_secs(1)), None);
-        r.set_for_retransmit(Instant::from_millis(1000));
+        r.set_for_retransmit(Instant::from_millis(1000), RTO);
         assert_eq!(r.should_retransmit(Instant::from_millis(1000)), None);
         assert_eq!(r.should_retransmit(Instant::from_millis(1050)), None);
         assert_eq!(r.should_retransmit(Instant::from_millis(1101)), Some(Duration::from_millis(101)));
-        r.set_for_retransmit(Instant::from_millis(1101));
+        r.set_for_retransmit(Instant::from_millis(1101), RTO);
         assert_eq!(r.should_retransmit(Instant::from_millis(1101)), None);
         assert_eq!(r.should_retransmit(Instant::from_millis(1150)), None);
         assert_eq!(r.should_retransmit(Instant::from_millis(1200)), None);
         assert_eq!(r.should_retransmit(Instant::from_millis(1301)), Some(Duration::from_millis(300)));
         r.set_for_idle(Instant::from_millis(1301), None);
         assert_eq!(r.should_retransmit(Instant::from_millis(1350)), None);
+    }
+
+    #[test]
+    fn test_rtt_estimator() {
+        #[cfg(feature = "log")]
+        init_logger();
+
+        let mut r = RttEstimator::default();
+
+        let rtos = &[
+            751, 766, 755, 731, 697, 656, 613, 567,
+            523, 484, 445, 411, 378, 350, 322, 299,
+            280, 261, 243, 229, 215, 206, 197, 188
+        ];
+
+        for &rto in rtos {
+            r.sample(100);
+            assert_eq!(r.retransmission_timeout(), Duration::from_millis(rto));
+        }
     }
 
 }

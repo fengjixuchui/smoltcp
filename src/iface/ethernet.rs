@@ -4,8 +4,6 @@
 
 use core::cmp;
 use managed::{ManagedSlice, ManagedMap};
-#[cfg(not(feature = "proto-igmp"))]
-use core::marker::PhantomData;
 
 use crate::{Error, Result};
 use crate::phy::{Device, DeviceCapabilities, RxToken, TxToken};
@@ -57,9 +55,9 @@ use crate::iface::Routes;
 /// The network interface logically owns a number of other data structures; to avoid
 /// a dependency on heap allocation, it instead owns a `BorrowMut<[T]>`, which can be
 /// a `&mut [T]`, or `Vec<T>` if a heap is available.
-pub struct Interface<'b, 'c, 'e, DeviceT: for<'d> Device<'d>> {
+pub struct Interface<'a, DeviceT: for<'d> Device<'d>> {
     device: DeviceT,
-    inner:  InterfaceInner<'b, 'c, 'e>,
+    inner:  InterfaceInner<'a>,
 }
 
 /// The device independent part of an Ethernet network interface.
@@ -69,17 +67,15 @@ pub struct Interface<'b, 'c, 'e, DeviceT: for<'d> Device<'d>> {
 /// the `device` mutably until they're used, which makes it impossible to call other
 /// methods on the `Interface` in this time (since its `device` field is borrowed
 /// exclusively). However, it is still possible to call methods on its `inner` field.
-struct InterfaceInner<'b, 'c, 'e> {
-    neighbor_cache:         NeighborCache<'b>,
+struct InterfaceInner<'a> {
+    neighbor_cache:         NeighborCache<'a>,
     ethernet_addr:          EthernetAddress,
-    ip_addrs:               ManagedSlice<'c, IpCidr>,
+    ip_addrs:               ManagedSlice<'a, IpCidr>,
     #[cfg(feature = "proto-ipv4")]
     any_ip:                 bool,
-    routes:                 Routes<'e>,
+    routes:                 Routes<'a>,
     #[cfg(feature = "proto-igmp")]
-    ipv4_multicast_groups:  ManagedMap<'e, Ipv4Address, ()>,
-    #[cfg(not(feature = "proto-igmp"))]
-    _ipv4_multicast_groups: PhantomData<&'e ()>,
+    ipv4_multicast_groups:  ManagedMap<'a, Ipv4Address, ()>,
     /// When to report for (all or) the next multicast group membership via IGMP
     #[cfg(feature = "proto-igmp")]
     igmp_report_state:      IgmpReportState,
@@ -88,22 +84,20 @@ struct InterfaceInner<'b, 'c, 'e> {
 
 /// A builder structure used for creating a Ethernet network
 /// interface.
-pub struct InterfaceBuilder <'b, 'c, 'e, DeviceT: for<'d> Device<'d>> {
+pub struct InterfaceBuilder <'a, DeviceT: for<'d> Device<'d>> {
     device:                 DeviceT,
     ethernet_addr:          Option<EthernetAddress>,
-    neighbor_cache:         Option<NeighborCache<'b>>,
-    ip_addrs:               ManagedSlice<'c, IpCidr>,
+    neighbor_cache:         Option<NeighborCache<'a>>,
+    ip_addrs:               ManagedSlice<'a, IpCidr>,
     #[cfg(feature = "proto-ipv4")]
     any_ip:                 bool,
-    routes:                 Routes<'e>,
+    routes:                 Routes<'a>,
     /// Does not share storage with `ipv6_multicast_groups` to avoid IPv6 size overhead.
     #[cfg(feature = "proto-igmp")]
-    ipv4_multicast_groups:  ManagedMap<'e, Ipv4Address, ()>,
-    #[cfg(not(feature = "proto-igmp"))]
-    _ipv4_multicast_groups: PhantomData<&'e ()>,
+    ipv4_multicast_groups:  ManagedMap<'a, Ipv4Address, ()>,
 }
 
-impl<'b, 'c, 'e, DeviceT> InterfaceBuilder<'b, 'c, 'e, DeviceT>
+impl<'a, DeviceT> InterfaceBuilder<'a, DeviceT>
         where DeviceT: for<'d> Device<'d> {
     /// Create a builder used for creating a network interface using the
     /// given device and address.
@@ -141,8 +135,6 @@ impl<'b, 'c, 'e, DeviceT> InterfaceBuilder<'b, 'c, 'e, DeviceT>
             routes:              Routes::new(ManagedMap::Borrowed(&mut [])),
             #[cfg(feature = "proto-igmp")]
             ipv4_multicast_groups:   ManagedMap::Borrowed(&mut []),
-            #[cfg(not(feature = "proto-igmp"))]
-            _ipv4_multicast_groups:  PhantomData,
         }
     }
 
@@ -167,7 +159,7 @@ impl<'b, 'c, 'e, DeviceT> InterfaceBuilder<'b, 'c, 'e, DeviceT>
     ///
     /// [ip_addrs]: struct.EthernetInterface.html#method.ip_addrs
     pub fn ip_addrs<T>(mut self, ip_addrs: T) -> Self
-        where T: Into<ManagedSlice<'c, IpCidr>>
+        where T: Into<ManagedSlice<'a, IpCidr>>
     {
         let ip_addrs = ip_addrs.into();
         InterfaceInner::check_ip_addrs(&ip_addrs);
@@ -198,8 +190,8 @@ impl<'b, 'c, 'e, DeviceT> InterfaceBuilder<'b, 'c, 'e, DeviceT>
     /// [routes].
     ///
     /// [routes]: struct.EthernetInterface.html#method.routes
-    pub fn routes<T>(mut self, routes: T) -> InterfaceBuilder<'b, 'c, 'e, DeviceT>
-        where T: Into<Routes<'e>>
+    pub fn routes<T>(mut self, routes: T) -> InterfaceBuilder<'a, DeviceT>
+        where T: Into<Routes<'a>>
     {
         self.routes = routes.into();
         self
@@ -217,14 +209,14 @@ impl<'b, 'c, 'e, DeviceT> InterfaceBuilder<'b, 'c, 'e, DeviceT>
     /// [`join_multicast_group()`]: struct.EthernetInterface.html#method.join_multicast_group
     #[cfg(feature = "proto-igmp")]
     pub fn ipv4_multicast_groups<T>(mut self, ipv4_multicast_groups: T) -> Self
-        where T: Into<ManagedMap<'e, Ipv4Address, ()>>
+        where T: Into<ManagedMap<'a, Ipv4Address, ()>>
     {
         self.ipv4_multicast_groups = ipv4_multicast_groups.into();
         self
     }
 
     /// Set the Neighbor Cache the interface will use.
-    pub fn neighbor_cache(mut self, neighbor_cache: NeighborCache<'b>) -> Self {
+    pub fn neighbor_cache(mut self, neighbor_cache: NeighborCache<'a>) -> Self {
         self.neighbor_cache = Some(neighbor_cache);
         self
     }
@@ -240,7 +232,7 @@ impl<'b, 'c, 'e, DeviceT> InterfaceBuilder<'b, 'c, 'e, DeviceT>
     ///
     /// [ethernet_addr]: #method.ethernet_addr
     /// [neighbor_cache]: #method.neighbor_cache
-    pub fn finalize(self) -> Interface<'b, 'c, 'e, DeviceT> {
+    pub fn finalize(self) -> Interface<'a, DeviceT> {
         match (self.ethernet_addr, self.neighbor_cache) {
             (Some(ethernet_addr), Some(neighbor_cache)) => {
                 let device_capabilities = self.device.capabilities();
@@ -255,8 +247,6 @@ impl<'b, 'c, 'e, DeviceT> InterfaceBuilder<'b, 'c, 'e, DeviceT>
                         routes: self.routes,
                         #[cfg(feature = "proto-igmp")]
                         ipv4_multicast_groups: self.ipv4_multicast_groups,
-                        #[cfg(not(feature = "proto-igmp"))]
-                        _ipv4_multicast_groups:  PhantomData,
                         #[cfg(feature = "proto-igmp")]
                         igmp_report_state: IgmpReportState::Inactive,
                     }
@@ -385,7 +375,7 @@ enum IgmpReportState {
     },
 }
 
-impl<'b, 'c, 'e, DeviceT> Interface<'b, 'c, 'e, DeviceT>
+impl<'a, DeviceT> Interface<'a, DeviceT>
         where DeviceT: for<'d> Device<'d> {
     /// Get the Ethernet address of the interface.
     pub fn ethernet_addr(&self) -> EthernetAddress {
@@ -495,7 +485,7 @@ impl<'b, 'c, 'e, DeviceT> Interface<'b, 'c, 'e, DeviceT>
     ///
     /// # Panics
     /// This function panics if any of the addresses are not unicast.
-    pub fn update_ip_addrs<F: FnOnce(&mut ManagedSlice<'c, IpCidr>)>(&mut self, f: F) {
+    pub fn update_ip_addrs<F: FnOnce(&mut ManagedSlice<'a, IpCidr>)>(&mut self, f: F) {
         f(&mut self.inner.ip_addrs);
         InterfaceInner::check_ip_addrs(&self.inner.ip_addrs)
     }
@@ -511,11 +501,11 @@ impl<'b, 'c, 'e, DeviceT> Interface<'b, 'c, 'e, DeviceT>
         self.inner.ipv4_address()
     }
 
-    pub fn routes(&self) -> &Routes<'e> {
+    pub fn routes(&self) -> &Routes<'a> {
         &self.inner.routes
     }
 
-    pub fn routes_mut(&mut self) -> &mut Routes<'e> {
+    pub fn routes_mut(&mut self) -> &mut Routes<'a> {
         &mut self.inner.routes
     }
 
@@ -678,7 +668,6 @@ impl<'b, 'c, 'e, DeviceT> Interface<'b, 'c, 'e, DeviceT>
                     Socket::Tcp(ref mut socket) =>
                         socket.dispatch(timestamp, &caps, |response|
                             respond!(IpPacket::Tcp(response))),
-                    Socket::__Nonexhaustive(_) => unreachable!()
                 };
 
             match (device_result, socket_result) {
@@ -753,7 +742,7 @@ impl<'b, 'c, 'e, DeviceT> Interface<'b, 'c, 'e, DeviceT>
     }
 }
 
-impl<'b, 'c, 'e> InterfaceInner<'b, 'c, 'e> {
+impl<'a> InterfaceInner<'a> {
     fn check_ethernet_addr(addr: &EthernetAddress) {
         if addr.is_multicast() {
             panic!("Ethernet address {} is not unicast", addr)
@@ -800,7 +789,8 @@ impl<'b, 'c, 'e> InterfaceInner<'b, 'c, 'e> {
             .filter_map(
                 |addr| match *addr {
                     IpCidr::Ipv4(cidr) => Some(cidr.address()),
-                    _ => None,
+                    #[cfg(feature = "proto-ipv6")]
+                    IpCidr::Ipv6(_) => None
                 })
             .next()
     }
@@ -886,8 +876,6 @@ impl<'b, 'c, 'e> InterfaceInner<'b, 'c, 'e> {
                     Ok(None)
                 }
             }
-
-            _ => Err(Error::Unrecognized)
         }
     }
 
@@ -1025,15 +1013,14 @@ impl<'b, 'c, 'e> InterfaceInner<'b, 'c, 'e> {
 
         if !self.has_ip_addr(ipv4_repr.dst_addr) &&
            !ipv4_repr.dst_addr.is_broadcast() &&
-           !self.has_multicast_group(ipv4_repr.dst_addr) {
+           !self.has_multicast_group(ipv4_repr.dst_addr) &&
+           !self.is_subnet_broadcast(ipv4_repr.dst_addr) {
+
             // Ignore IP packets not directed at us, or broadcast, or any of the multicast groups.
             // If AnyIP is enabled, also check if the packet is routed locally.
-            if !self.any_ip {
-                return Ok(None);
-            } else if match self.routes.lookup(&IpAddress::Ipv4(ipv4_repr.dst_addr), timestamp) {
-                Some(router_addr) => !self.has_ip_addr(router_addr),
-                None => true,
-            } {
+            if !self.any_ip ||
+                    self.routes.lookup(&IpAddress::Ipv4(ipv4_repr.dst_addr), timestamp)
+                        .map_or(true, |router_addr| !self.has_ip_addr(router_addr)) {
                 return Ok(None);
             }
         }
@@ -1070,6 +1057,19 @@ impl<'b, 'c, 'e> InterfaceInner<'b, 'c, 'e> {
             }
         }
     }
+
+    /// Checks if an incoming packet has a broadcast address for the interfaces
+    /// associated ipv4 addresses.
+    #[cfg(feature = "proto-ipv4")]
+    fn is_subnet_broadcast(&self, address: Ipv4Address) -> bool {
+        self.ip_addrs.iter()
+            .filter_map(|own_cidr| match own_cidr {
+                IpCidr::Ipv4(own_ip) => Some(own_ip.broadcast()?),
+                #[cfg(feature = "proto-ipv6")]
+                IpCidr::Ipv6(_) => None
+            })
+            .any(|broadcast_address| address == broadcast_address)
+    } 
 
     /// Host duties of the **IGMPv2** protocol.
     ///
@@ -1190,10 +1190,9 @@ impl<'b, 'c, 'e> InterfaceInner<'b, 'c, 'e> {
                 let ip_addr = ip_repr.src_addr.into();
                 match lladdr {
                     Some(lladdr) if lladdr.is_unicast() && target_addr.is_unicast() => {
-                        if flags.contains(NdiscNeighborFlags::OVERRIDE) {
+                        if flags.contains(NdiscNeighborFlags::OVERRIDE) ||
+                                !self.neighbor_cache.lookup(&ip_addr, timestamp).found() {
                             self.neighbor_cache.fill(ip_addr, lladdr, timestamp)
-                        } else if !self.neighbor_cache.lookup(&ip_addr, timestamp).found() {
-                                self.neighbor_cache.fill(ip_addr, lladdr, timestamp)
                         }
                     },
                     _ => (),
@@ -1253,7 +1252,6 @@ impl<'b, 'c, 'e> InterfaceInner<'b, 'c, 'e> {
                         }
                     }
                 }
-                _ => return Err(Error::Unrecognized),
             }
         }
         self.process_nxt_hdr(sockets, timestamp, ipv6_repr, hbh_repr.next_header,
@@ -1421,8 +1419,7 @@ impl<'b, 'c, 'e> InterfaceInner<'b, 'c, 'e> {
                 };
                 Ok(self.icmpv6_reply(ipv6_repr, icmpv6_reply_repr))
             },
-            IpRepr::Unspecified { .. } |
-            IpRepr::__Nonexhaustive => Err(Error::Unaddressable),
+            IpRepr::Unspecified { .. } => Err(Error::Unaddressable),
         }
     }
 
@@ -1467,7 +1464,6 @@ impl<'b, 'c, 'e> InterfaceInner<'b, 'c, 'e> {
                 let dst_hardware_addr =
                     match arp_repr {
                         ArpRepr::EthernetIpv4 { target_hardware_addr, .. } => target_hardware_addr,
-                        _ => unreachable!()
                     };
 
                 self.dispatch_ethernet(tx_token, timestamp, arp_repr.buffer_len(), |mut frame| {
@@ -1555,8 +1551,6 @@ impl<'b, 'c, 'e> InterfaceInner<'b, 'c, 'e> {
                             b[12], b[13],
                             b[14], b[15],
                         ])),
-                    IpAddress::__Nonexhaustive =>
-                        unreachable!()
                 };
             if let Some(hardware_addr) = hardware_addr {
                 return Ok((hardware_addr, tx_token))
@@ -1601,7 +1595,7 @@ impl<'b, 'c, 'e> InterfaceInner<'b, 'c, 'e> {
                            dst_addr);
 
                 let solicit = Icmpv6Repr::Ndisc(NdiscRepr::NeighborSolicit {
-                    target_addr: src_addr,
+                    target_addr: dst_addr,
                     lladdr: Some(self.ethernet_addr),
                 });
 
@@ -1706,7 +1700,7 @@ mod test {
     use crate::wire::{EthernetAddress, EthernetFrame, EthernetProtocol};
     use crate::wire::{IpAddress, IpCidr, IpProtocol, IpRepr};
     #[cfg(feature = "proto-ipv4")]
-    use crate::wire::{Ipv4Address, Ipv4Repr};
+    use crate::wire::{Ipv4Address, Ipv4Repr, Ipv4Cidr};
     #[cfg(feature = "proto-igmp")]
     use crate::wire::Ipv4Packet;
     #[cfg(feature = "proto-ipv4")]
@@ -1726,8 +1720,7 @@ mod test {
 
     use super::{EthernetPacket, IpPacket};
 
-    fn create_loopback<'a, 'b, 'c>() -> (EthernetInterface<'static, 'b, 'c, Loopback>,
-                                         SocketSet<'static, 'a, 'b>) {
+    fn create_loopback<'a>() -> (EthernetInterface<'a, Loopback>, SocketSet<'a>) {
         // Create a basic device
         let device = Loopback::new();
         let ip_addrs = [
@@ -1753,11 +1746,11 @@ mod test {
     }
 
     #[cfg(feature = "proto-igmp")]
-    fn recv_all<'b>(iface: &mut EthernetInterface<'static, 'b, 'static, Loopback>, timestamp: Instant) -> Vec<Vec<u8>> {
+    fn recv_all(iface: &mut EthernetInterface<'_, Loopback>, timestamp: Instant) -> Vec<Vec<u8>> {
         let mut pkts = Vec::new();
         while let Some((rx, _tx)) = iface.device.receive() {
             rx.consume(timestamp, |pkt| {
-                pkts.push(pkt.iter().cloned().collect());
+                pkts.push(pkt.to_vec());
                 Ok(())
             }).unwrap();
         }
@@ -1770,7 +1763,7 @@ mod test {
     impl phy::TxToken for MockTxToken {
         fn consume<R, F>(self, _: Instant, _: usize, _: F) -> Result<R>
                 where F: FnOnce(&mut [u8]) -> Result<R> {
-            Err(Error::__Nonexhaustive)
+            Err(Error::Unaddressable)
         }
     }
 
@@ -1884,6 +1877,40 @@ mod test {
         // And we correctly handle no payload.
         assert_eq!(iface.inner.process_ipv4(&mut socket_set, Instant::from_millis(0), &frame),
                    Ok(Some(expected_repr)));
+    }
+
+    #[test]
+    #[cfg(feature = "proto-ipv4")]
+    fn test_local_subnet_broadcasts() {
+        let (mut iface, _) = create_loopback();
+        iface.update_ip_addrs(|addrs| {
+            addrs.iter_mut().next().map(|addr| {
+                *addr = IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address([192, 168, 1, 23]), 24));
+            });
+        });
+
+        assert_eq!(iface.inner.is_subnet_broadcast(Ipv4Address([192, 168, 1, 255])), true);
+        assert_eq!(iface.inner.is_subnet_broadcast(Ipv4Address([192, 168, 1, 254])), false);
+
+        iface.update_ip_addrs(|addrs| {
+            addrs.iter_mut().next().map(|addr| {
+                *addr = IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address([192, 168, 23, 24]), 16));
+            });
+        });
+        assert_eq!(iface.inner.is_subnet_broadcast(Ipv4Address([192, 168, 23, 255])), false);
+        assert_eq!(iface.inner.is_subnet_broadcast(Ipv4Address([192, 168, 23, 254])), false);
+        assert_eq!(iface.inner.is_subnet_broadcast(Ipv4Address([192, 168, 255, 254])), false);
+        assert_eq!(iface.inner.is_subnet_broadcast(Ipv4Address([192, 168, 255, 255])), true);
+
+        iface.update_ip_addrs(|addrs| {
+            addrs.iter_mut().next().map(|addr| {
+                *addr = IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address([192, 168, 23, 24]), 8));
+            });
+        });
+        assert_eq!(iface.inner.is_subnet_broadcast(Ipv4Address([192, 23, 1, 255])), false);
+        assert_eq!(iface.inner.is_subnet_broadcast(Ipv4Address([192, 23, 1, 254])), false);
+        assert_eq!(iface.inner.is_subnet_broadcast(Ipv4Address([192, 255, 255, 254])), false);
+        assert_eq!(iface.inner.is_subnet_broadcast(Ipv4Address([192, 255, 255, 255])), true);
     }
 
     #[test]
@@ -2495,7 +2522,7 @@ mod test {
     #[test]
     #[cfg(feature = "proto-igmp")]
     fn test_handle_igmp() {
-        fn recv_igmp<'b>(mut iface: &mut EthernetInterface<'static, 'b, 'static, Loopback>, timestamp: Instant) -> Vec<(Ipv4Repr, IgmpRepr)> {
+        fn recv_igmp(mut iface: &mut EthernetInterface<'_, Loopback>, timestamp: Instant) -> Vec<(Ipv4Repr, IgmpRepr)> {
             let checksum_caps = &iface.device.capabilities().checksum;
             recv_all(&mut iface, timestamp)
                 .iter()
@@ -2567,7 +2594,7 @@ mod test {
         // Leave multicast groups
         let timestamp = Instant::now();
         for group in &groups {
-            iface.leave_multicast_group(group.clone(), timestamp)
+            iface.leave_multicast_group(*group, timestamp)
                 .unwrap();
         }
 

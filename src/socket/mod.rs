@@ -11,7 +11,6 @@ The interface implemented by this module uses explicit buffering: you decide on 
 size for a buffer, allocate it, and let the networking stack use it.
 */
 
-use core::marker::PhantomData;
 use crate::time::Instant;
 
 mod meta;
@@ -71,16 +70,6 @@ pub(crate) enum PollAt {
     Ingress,
 }
 
-impl PollAt {
-    #[cfg(feature = "socket-tcp")]
-    fn is_ingress(&self) -> bool {
-        match *self {
-            PollAt::Ingress => true,
-            _ => false,
-        }
-    }
-}
-
 /// A network socket.
 ///
 /// This enumeration abstracts the various types of sockets based on the IP protocol.
@@ -92,17 +81,15 @@ impl PollAt {
 /// [AnySocket]: trait.AnySocket.html
 /// [SocketSet::get]: struct.SocketSet.html#method.get
 #[derive(Debug)]
-pub enum Socket<'a, 'b: 'a> {
+pub enum Socket<'a> {
     #[cfg(feature = "socket-raw")]
-    Raw(RawSocket<'a, 'b>),
+    Raw(RawSocket<'a>),
     #[cfg(all(feature = "socket-icmp", any(feature = "proto-ipv4", feature = "proto-ipv6")))]
-    Icmp(IcmpSocket<'a, 'b>),
+    Icmp(IcmpSocket<'a>),
     #[cfg(feature = "socket-udp")]
-    Udp(UdpSocket<'a, 'b>),
+    Udp(UdpSocket<'a>),
     #[cfg(feature = "socket-tcp")]
     Tcp(TcpSocket<'a>),
-    #[doc(hidden)]
-    __Nonexhaustive(PhantomData<(&'a (), &'b ())>)
 }
 
 macro_rules! dispatch_socket {
@@ -122,12 +109,11 @@ macro_rules! dispatch_socket {
             &$( $mut_ )* Socket::Udp(ref $( $mut_ )* $socket) => $code,
             #[cfg(feature = "socket-tcp")]
             &$( $mut_ )* Socket::Tcp(ref $( $mut_ )* $socket) => $code,
-            &$( $mut_ )* Socket::__Nonexhaustive(_) => unreachable!()
         }
     };
 }
 
-impl<'a, 'b> Socket<'a, 'b> {
+impl<'a> Socket<'a> {
     /// Return the socket handle.
     #[inline]
     pub fn handle(&self) -> SocketHandle {
@@ -147,26 +133,27 @@ impl<'a, 'b> Socket<'a, 'b> {
     }
 }
 
-impl<'a, 'b> SocketSession for Socket<'a, 'b> {
+impl<'a> SocketSession for Socket<'a> {
     fn finish(&mut self) {
         dispatch_socket!(mut self, |socket| socket.finish())
     }
 }
 
 /// A conversion trait for network sockets.
-pub trait AnySocket<'a, 'b>: SocketSession + Sized {
-    fn downcast<'c>(socket_ref: SocketRef<'c, Socket<'a, 'b>>) ->
+pub trait AnySocket<'a>: SocketSession + Sized {
+    fn downcast<'c>(socket_ref: SocketRef<'c, Socket<'a>>) ->
                    Option<SocketRef<'c, Self>>;
 }
 
 macro_rules! from_socket {
     ($socket:ty, $variant:ident) => {
-        impl<'a, 'b> AnySocket<'a, 'b> for $socket {
-            fn downcast<'c>(ref_: SocketRef<'c, Socket<'a, 'b>>) ->
+        impl<'a> AnySocket<'a> for $socket {
+            fn downcast<'c>(ref_: SocketRef<'c, Socket<'a>>) ->
                            Option<SocketRef<'c, Self>> {
-                match SocketRef::into_inner(ref_) {
-                    &mut Socket::$variant(ref mut socket) => Some(SocketRef::new(socket)),
-                    _ => None,
+                if let Socket::$variant(ref mut socket) = SocketRef::into_inner(ref_) {
+                    Some(SocketRef::new(socket))
+                } else {
+                    None
                 }
             }
         }
@@ -174,10 +161,10 @@ macro_rules! from_socket {
 }
 
 #[cfg(feature = "socket-raw")]
-from_socket!(RawSocket<'a, 'b>, Raw);
+from_socket!(RawSocket<'a>, Raw);
 #[cfg(all(feature = "socket-icmp", any(feature = "proto-ipv4", feature = "proto-ipv6")))]
-from_socket!(IcmpSocket<'a, 'b>, Icmp);
+from_socket!(IcmpSocket<'a>, Icmp);
 #[cfg(feature = "socket-udp")]
-from_socket!(UdpSocket<'a, 'b>, Udp);
+from_socket!(UdpSocket<'a>, Udp);
 #[cfg(feature = "socket-tcp")]
 from_socket!(TcpSocket<'a>, Tcp);

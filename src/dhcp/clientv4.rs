@@ -94,8 +94,7 @@ impl Client {
     ///     Instant::now()
     /// );
     /// ```
-    pub fn new<'a, 'b, 'c>(sockets: &mut SocketSet<'a, 'b, 'c>, rx_buffer: RawSocketBuffer<'b, 'c>, tx_buffer: RawSocketBuffer<'b, 'c>, now: Instant) -> Self
-    where 'b: 'c,
+    pub fn new<'a>(sockets: &mut SocketSet<'a>, rx_buffer: RawSocketBuffer<'a>, tx_buffer: RawSocketBuffer<'a>, now: Instant) -> Self
     {
         let raw_socket = RawSocket::new(IpVersion::Ipv4, IpProtocol::Udp, rx_buffer, tx_buffer);
         let raw_handle = sockets.add(raw_socket);

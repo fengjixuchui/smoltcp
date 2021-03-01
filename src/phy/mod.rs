@@ -158,6 +158,7 @@ impl Checksum {
 
 /// A description of checksum behavior for every supported protocol.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct ChecksumCapabilities {
     pub ipv4: Checksum,
     pub udp: Checksum,
@@ -166,7 +167,6 @@ pub struct ChecksumCapabilities {
     pub icmpv4: Checksum,
     #[cfg(feature = "proto-ipv6")]
     pub icmpv6: Checksum,
-    dummy: (),
 }
 
 impl ChecksumCapabilities {
@@ -181,7 +181,6 @@ impl ChecksumCapabilities {
             icmpv4: Checksum::None,
             #[cfg(feature = "proto-ipv6")]
             icmpv6: Checksum::None,
-            ..Self::default()
         }
     }
 }
@@ -191,13 +190,20 @@ impl ChecksumCapabilities {
 /// Higher-level protocols may achieve higher throughput or lower latency if they consider
 /// the bandwidth or packet size limitations.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct DeviceCapabilities {
     /// Maximum transmission unit.
     ///
     /// The network device is unable to send or receive frames larger than the value returned
     /// by this function.
     ///
-    /// For Ethernet, MTU will fall between 576 (for IPv4) or 1280 (for IPv6) and 9216 octets.
+    /// For Ethernet devices, this is the maximum Ethernet frame size, including the Ethernet header (14 octets), but
+    /// *not* including the Ethernet FCS (4 octets). Therefore, Ethernet MTU = IP MTU + 14.
+    ///
+    /// Note that in Linux and other OSes, "MTU" is the IP MTU, not the Ethernet MTU, even for Ethernet
+    /// devices. This is a common source of confusion.
+    ///
+    /// Most common IP MTU is 1500. Minimum is 576 (for IPv4) or 1280 (for IPv6). Maximum is 9216 octets.
     pub max_transmission_unit: usize,
 
     /// Maximum burst size, in terms of MTU.
@@ -214,10 +220,6 @@ pub struct DeviceCapabilities {
     /// If the network device is capable of verifying or computing checksums for some protocols,
     /// it can request that the stack not do so in software to improve performance.
     pub checksum: ChecksumCapabilities,
-
-    /// Only present to prevent people from trying to initialize every field of DeviceLimits,
-    /// which would not let us add new fields in the future.
-    dummy: ()
 }
 
 /// An interface for sending and receiving raw network frames.
