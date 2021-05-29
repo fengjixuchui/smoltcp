@@ -5,8 +5,13 @@ macro_rules! net_log {
     (debug, $($arg:expr),*) => { log::debug!($($arg),*); };
 }
 
-#[cfg(not(feature = "log"))]
-#[macro_use]
+#[cfg(feature = "defmt")]
+macro_rules! net_log {
+    (trace, $($arg:expr),*) => { defmt::trace!($($arg),*); };
+    (debug, $($arg:expr),*) => { defmt::debug!($($arg),*); };
+}
+
+#[cfg(not(any(feature = "log", feature = "defmt")))]
 macro_rules! net_log {
     ($level:ident, $($arg:expr),*) => { $( let _ = $arg; )* }
 }
@@ -23,26 +28,14 @@ macro_rules! enum_with_unknown {
     (
         $( #[$enum_attr:meta] )*
         pub enum $name:ident($ty:ty) {
-            $( $variant:ident = $value:expr ),+ $(,)*
-        }
-    ) => {
-        enum_with_unknown! {
-            $( #[$enum_attr] )*
-            pub doc enum $name($ty) {
-                $( #[doc(shown)] $variant = $value ),+
-            }
-        }
-    };
-    (
-        $( #[$enum_attr:meta] )*
-        pub doc enum $name:ident($ty:ty) {
             $(
-              $( #[$variant_attr:meta] )+
-              $variant:ident = $value:expr $(,)*
-            ),+
+              $( #[$variant_attr:meta] )*
+              $variant:ident = $value:expr
+            ),+ $(,)?
         }
     ) => {
         #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+        #[cfg_attr(feature = "defmt", derive(defmt::Format))]
         $( #[$enum_attr] )*
         pub enum $name {
             $(

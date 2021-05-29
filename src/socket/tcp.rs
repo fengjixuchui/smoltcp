@@ -7,7 +7,6 @@ use core::{cmp, fmt, mem};
 use core::task::Waker;
 
 use crate::{Error, Result};
-use crate::phy::DeviceCapabilities;
 use crate::time::{Duration, Instant};
 use crate::socket::{Socket, SocketMeta, SocketHandle, PollAt};
 use crate::storage::{Assembler, RingBuffer};
@@ -22,6 +21,7 @@ pub type SocketBuffer<'a> = RingBuffer<'a, u8>;
 ///
 /// [RFC 793]: https://tools.ietf.org/html/rfc793
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum State {
     Closed,
     Listen,
@@ -140,7 +140,7 @@ impl RttEstimator {
             // all packets sent would incur a retransmit. To avoid this, force an estimate
             // increase if we see 3 consecutive retransmissions without any successful sample.
             self.rto_count = 0;
-            self.rtt *= 2;
+            self.rtt = RTTE_MAX_RTO.min(self.rtt*2);
             let rto = self.retransmission_timeout().millis();
             net_trace!("rtte: too many retransmissions, increasing: rtt={:?} dev={:?} rto={:?}", self.rtt, self.deviation, rto);
         }
@@ -148,6 +148,7 @@ impl RttEstimator {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 enum Timer {
     Idle {
         keep_alive_at: Option<Instant>,
@@ -752,7 +753,7 @@ impl<'a> TcpSocket<'a> {
     /// If a connection is established, [abort](#method.close) will send a reset to
     /// the remote endpoint.
     ///
-    /// In terms of the TCP state machine, the socket must be in the `CLOSED`, `TIME-WAIT`,
+    /// In terms of the TCP state machine, the socket must not be in the `CLOSED`, `TIME-WAIT`,
     /// or `LISTEN` state.
     #[inline]
     pub fn is_active(&self) -> bool {
@@ -858,7 +859,7 @@ impl<'a> TcpSocket<'a> {
     /// Call `f` with the largest contiguous slice of octets in the transmit buffer,
     /// and enqueue the amount of elements returned by `f`.
     ///
-    /// This function returns `Err(Error::Illegal) if the transmit half of
+    /// This function returns `Err(Error::Illegal)` if the transmit half of
     /// the connection is not open; see [may_send](#method.may_send).
     pub fn send<'b, F, R>(&'b mut self, f: F) -> Result<R>
             where F: FnOnce(&'b mut [u8]) -> (usize, R) {
@@ -1438,10 +1439,14 @@ impl<'a> TcpSocket<'a> {
 
             // ACK packets in LAST-ACK state change it to CLOSED.
             (State::LastAck, TcpControl::None) => {
-                // Clear the remote endpoint, or we'll send an RST there.
-                self.set_state(State::Closed);
-                self.local_endpoint  = IpEndpoint::default();
-                self.remote_endpoint = IpEndpoint::default();
+                if ack_of_fin {
+                    // Clear the remote endpoint, or we'll send an RST there.
+                    self.set_state(State::Closed);
+                    self.local_endpoint  = IpEndpoint::default();
+                    self.remote_endpoint = IpEndpoint::default();
+                } else {
+                    self.timer.set_for_idle(timestamp, self.keep_alive);
+                }
             }
 
             _ => {
@@ -1662,7 +1667,7 @@ impl<'a> TcpSocket<'a> {
         }
     }
 
-    pub(crate) fn dispatch<F>(&mut self, timestamp: Instant, caps: &DeviceCapabilities,
+    pub(crate) fn dispatch<F>(&mut self, timestamp: Instant, ip_mtu: usize,
                               emit: F) -> Result<()>
             where F: FnOnce((IpRepr, TcpRepr)) -> Result<()> {
         if !self.remote_endpoint.is_specified() { return Err(Error::Exhausted) }
@@ -1789,7 +1794,7 @@ impl<'a> TcpSocket<'a> {
                 let offset = self.remote_last_seq - self.local_seq_no;
                 let win_limit = self.local_seq_no + self.remote_win_len - self.remote_last_seq;
                 let size = cmp::min(cmp::min(win_limit, self.remote_mss),
-                     caps.max_transmission_unit - ip_repr.buffer_len() - repr.mss_header_len());
+                     ip_mtu - ip_repr.buffer_len() - repr.mss_header_len());
                 repr.payload = self.tx_buffer.get_allocated(offset, size);
                 // If we've sent everything we had in the buffer, follow it with the PSH or FIN
                 // flags, depending on whether the transmit half of the connection is open.
@@ -1848,7 +1853,7 @@ impl<'a> TcpSocket<'a> {
 
         if repr.control == TcpControl::Syn {
             // Fill the MSS option. See RFC 6691 for an explanation of this calculation.
-            let mut max_segment_size = caps.max_transmission_unit;
+            let mut max_segment_size = ip_mtu;
             max_segment_size -= ip_repr.buffer_len();
             max_segment_size -= repr.mss_header_len();
             repr.max_seg_size = Some(max_segment_size as u16);
@@ -2044,11 +2049,8 @@ mod test {
 
     fn recv<F>(socket: &mut TcpSocket, timestamp: Instant, mut f: F)
             where F: FnMut(Result<TcpRepr>) {
-        let caps = DeviceCapabilities {
-            max_transmission_unit: 1520,
-            ..Default::default()
-        };
-        let result = socket.dispatch(timestamp, &caps, |(ip_repr, tcp_repr)| {
+        let mtu = 1520;
+        let result = socket.dispatch(timestamp, mtu, |(ip_repr, tcp_repr)| {
             let ip_repr = ip_repr.lower(&[IpCidr::new(LOCAL_END.addr, 24)]).unwrap();
 
             assert_eq!(ip_repr.protocol(), IpProtocol::Tcp);
@@ -3490,6 +3492,34 @@ mod test {
     }
 
     #[test]
+    fn test_last_ack_ack_not_of_fin() {
+        let mut s = socket_last_ack();
+        recv!(s, [TcpRepr {
+            control: TcpControl::Fin,
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1 + 1),
+            ..RECV_TEMPL
+        }]);
+        assert_eq!(s.state, State::LastAck);
+
+        // ACK received that doesn't ack the FIN: socket should stay in LastAck.
+        send!(s, TcpRepr {
+            seq_number: REMOTE_SEQ + 1 + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            ..SEND_TEMPL
+        });
+        assert_eq!(s.state, State::LastAck);
+
+        // ACK received of fin: socket should change to Closed.
+        send!(s, TcpRepr {
+            seq_number: REMOTE_SEQ + 1 + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 1),
+            ..SEND_TEMPL
+        });
+        assert_eq!(s.state, State::Closed);
+    }
+
+    #[test]
     fn test_last_ack_close() {
         let mut s = socket_last_ack();
         s.close();
@@ -4897,13 +4927,10 @@ mod test {
     #[test]
     fn test_set_hop_limit() {
         let mut s = socket_syn_received();
-        let caps = DeviceCapabilities {
-            max_transmission_unit: 1520,
-            ..Default::default()
-        };
+        let mtu = 1520;
 
         s.set_hop_limit(Some(0x2a));
-        assert_eq!(s.dispatch(Instant::from_millis(0), &caps, |(ip_repr, _)| {
+        assert_eq!(s.dispatch(Instant::from_millis(0), mtu, |(ip_repr, _)| {
             assert_eq!(ip_repr.hop_limit(), 0x2a);
             Ok(())
         }), Ok(()));

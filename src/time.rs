@@ -22,6 +22,7 @@ use core::{ops, fmt};
 /// * A value less than `0` indicates a time before the starting
 ///   point.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Instant {
     pub millis: i64,
 }
@@ -135,6 +136,7 @@ impl ops::Sub<Instant> for Instant {
 
 /// A relative amount of time.
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Duration {
     pub millis: u64,
 }
@@ -227,6 +229,34 @@ impl ops::Div<u32> for Duration {
 impl ops::DivAssign<u32> for Duration {
     fn div_assign(&mut self, rhs: u32) {
         self.millis /= rhs as u64;
+    }
+}
+
+impl ops::Shl<u32> for Duration {
+    type Output = Duration;
+    
+    fn shl(self, rhs: u32) -> Duration {
+        Duration::from_millis(self.millis << rhs)
+    }
+}
+
+impl ops::ShlAssign<u32> for Duration {
+    fn shl_assign(&mut self, rhs: u32) {
+        self.millis <<= rhs;
+    }
+}
+
+impl ops::Shr<u32> for Duration {
+    type Output = Duration;
+    
+    fn shr(self, rhs: u32) -> Duration {
+        Duration::from_millis(self.millis >> rhs)
+    }
+}
+
+impl ops::ShrAssign<u32> for Duration {
+    fn shr_assign(&mut self, rhs: u32) {
+        self.millis >>= rhs;
     }
 }
 

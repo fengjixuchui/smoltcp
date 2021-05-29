@@ -6,6 +6,10 @@ use crate::{Error, Result};
 use crate::wire::{EthernetAddress, Ipv4Address};
 use crate::wire::arp::Hardware;
 
+pub const SERVER_PORT: u16 = 67;
+pub const CLIENT_PORT: u16 = 68;
+pub const MAX_DNS_SERVER_COUNT: usize = 3;
+
 const DHCP_MAGIC_NUMBER: u32 = 0x63825363;
 
 enum_with_unknown! {
@@ -43,6 +47,7 @@ impl MessageType {
 
 /// A representation of a single DHCP option.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum DhcpOption<'a> {
     EndOfList,
     Pad,
@@ -50,6 +55,7 @@ pub enum DhcpOption<'a> {
     RequestedIp(Ipv4Address),
     ClientIdentifier(EthernetAddress),
     ServerIdentifier(Ipv4Address),
+    IpLeaseTime(u32),
     Router(Ipv4Address),
     SubnetMask(Ipv4Address),
     MaximumDhcpMessageSize(u16),
@@ -103,6 +109,9 @@ impl<'a> DhcpOption<'a> {
                     (field::OPT_MAX_DHCP_MESSAGE_SIZE, 2) => {
                         option = DhcpOption::MaximumDhcpMessageSize(u16::from_be_bytes([data[0], data[1]]));
                     }
+                    (field::OPT_IP_LEASE_TIME, 4) => {
+                        option = DhcpOption::IpLeaseTime(u32::from_be_bytes([data[0], data[1], data[2], data[3]]))
+                    }
                     (_, _) => {
                         option = DhcpOption::Other { kind: kind, data: data };
                     }
@@ -129,6 +138,7 @@ impl<'a> DhcpOption<'a> {
             &DhcpOption::MaximumDhcpMessageSize(_) => {
                 4
             }
+            &DhcpOption::IpLeaseTime(_) => 6,
             &DhcpOption::Other { data, .. } => 2 + data.len()
         }
     }
@@ -178,6 +188,10 @@ impl<'a> DhcpOption<'a> {
                         buffer[0] = field::OPT_MAX_DHCP_MESSAGE_SIZE;
                         buffer[2..4].copy_from_slice(&size.to_be_bytes()[..]);
                     }
+                    DhcpOption::IpLeaseTime(lease_time) => {
+                        buffer[0] = field::OPT_IP_LEASE_TIME;
+                        buffer[2..6].copy_from_slice(&lease_time.to_be_bytes()[..]);
+                    }
                     DhcpOption::Other { kind, data: provided } => {
                         buffer[0] = kind;
                         buffer[2..skip_length].copy_from_slice(provided);
@@ -191,6 +205,7 @@ impl<'a> DhcpOption<'a> {
 
 /// A read/write wrapper around a Dynamic Host Configuration Protocol packet buffer.
 #[derive(Debug, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Packet<T: AsRef<[u8]>> {
     buffer: T
 }
@@ -615,6 +630,7 @@ impl<'a, T: AsRef<[u8]> + AsMut<[u8]> + ?Sized> Packet<&'a mut T> {
 ///
 /// The `options` field has a variable length.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Repr<'a> {
     /// This field is also known as `op` in the RFC. It indicates the type of DHCP message this
     /// packet represents.
@@ -671,9 +687,11 @@ pub struct Repr<'a> {
     /// the client is interested in.
     pub parameter_request_list: Option<&'a [u8]>,
     /// DNS servers
-    pub dns_servers: Option<[Option<Ipv4Address>; 3]>,
+    pub dns_servers: Option<[Option<Ipv4Address>; MAX_DNS_SERVER_COUNT]>,
     /// The maximum size dhcp packet the interface can receive
     pub max_size: Option<u16>,
+    /// The DHCP IP lease duration, specified in seconds.
+    pub lease_duration: Option<u32>
 }
 
 impl<'a> Repr<'a> {
@@ -686,6 +704,9 @@ impl<'a> Repr<'a> {
         if self.client_identifier.is_some() { len += 9; }
         if self.server_identifier.is_some() { len += 6; }
         if self.max_size.is_some() { len += 4; }
+        if self.router.is_some() { len += 6; }
+        if self.subnet_mask.is_some() { len += 6; }
+        if self.lease_duration.is_some() { len += 6; }
         if let Some(list) = self.parameter_request_list { len += list.len() + 2; }
 
         len
@@ -725,6 +746,7 @@ impl<'a> Repr<'a> {
         let mut parameter_request_list = None;
         let mut dns_servers = None;
         let mut max_size = None;
+        let mut lease_duration = None;
 
         let mut options = packet.options()?;
         while !options.is_empty() {
@@ -755,11 +777,14 @@ impl<'a> Repr<'a> {
                 DhcpOption::MaximumDhcpMessageSize(size) => {
                     max_size = Some(size);
                 }
+                DhcpOption::IpLeaseTime(duration) => {
+                    lease_duration = Some(duration);
+                }
                 DhcpOption::Other {kind: field::OPT_PARAMETER_REQUEST_LIST, data} => {
                     parameter_request_list = Some(data);
                 }
                 DhcpOption::Other {kind: field::OPT_DOMAIN_NAME_SERVER, data} => {
-                    let mut servers = [None; 3];
+                    let mut servers = [None; MAX_DNS_SERVER_COUNT];
                     for (server, chunk) in servers.iter_mut().zip(data.chunks(4)) {
                         *server = Some(Ipv4Address::from_bytes(chunk));
                     }
@@ -776,6 +801,7 @@ impl<'a> Repr<'a> {
             transaction_id, client_hardware_address, client_ip, your_ip, server_ip, relay_agent_ip,
             broadcast, requested_ip, server_identifier, router,
             subnet_mask, client_identifier, parameter_request_list, dns_servers, max_size,
+            lease_duration,
             message_type: message_type?,
         })
     }
@@ -801,28 +827,30 @@ impl<'a> Repr<'a> {
 
         {
             let mut options = packet.options_mut()?;
-            let tmp = options; options = DhcpOption::MessageType(self.message_type).emit(tmp);
+            options = DhcpOption::MessageType(self.message_type).emit(options);
             if let Some(eth_addr) = self.client_identifier {
-                let tmp = options; options = DhcpOption::ClientIdentifier(eth_addr).emit(tmp);
+                options = DhcpOption::ClientIdentifier(eth_addr).emit(options);
             }
             if let Some(ip) = self.server_identifier {
-                let tmp = options; options = DhcpOption::ServerIdentifier(ip).emit(tmp);
+                options = DhcpOption::ServerIdentifier(ip).emit(options);
             }
             if let Some(ip) = self.router {
-                let tmp = options; options = DhcpOption::Router(ip).emit(tmp);
+                options = DhcpOption::Router(ip).emit(options);
             }
             if let Some(ip) = self.subnet_mask {
-                let tmp = options; options = DhcpOption::SubnetMask(ip).emit(tmp);
+                options = DhcpOption::SubnetMask(ip).emit(options);
             }
             if let Some(ip) = self.requested_ip {
-                let tmp = options; options = DhcpOption::RequestedIp(ip).emit(tmp);
+                options = DhcpOption::RequestedIp(ip).emit(options);
             }
             if let Some(size) = self.max_size {
-                let tmp = options; options = DhcpOption::MaximumDhcpMessageSize(size).emit(tmp);
+                options = DhcpOption::MaximumDhcpMessageSize(size).emit(options);
+            }
+            if let Some(duration) = self.lease_duration {
+                options = DhcpOption::IpLeaseTime(duration).emit(options);
             }
             if let Some(list) = self.parameter_request_list {
-                let option = DhcpOption::Other{ kind: field::OPT_PARAMETER_REQUEST_LIST, data: list };
-                let tmp = options; options = option.emit(tmp);
+                options = DhcpOption::Other{ kind: field::OPT_PARAMETER_REQUEST_LIST, data: list }.emit(options);
             }
             DhcpOption::EndOfList.emit(options);
         }
@@ -858,7 +886,7 @@ mod test {
         0x00, 0x00, 0x39, 0x2, 0x5, 0xdc, 0x37, 0x04, 0x01, 0x03, 0x06, 0x2a, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     ];
 
-    static ACK_BYTES: &[u8] = &[
+    static ACK_DNS_SERVER_BYTES: &[u8] = &[
         0x02, 0x01, 0x06, 0x00, 0xcc, 0x34, 0x75, 0xab, 0x00, 0x00, 0x80, 0x00, 0x0a, 0xff, 0x06, 0x91,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, 0xff, 0x06, 0xfe, 0x34, 0x17, 0xeb, 0xc9,
         0xaa, 0x2f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -880,6 +908,28 @@ mod test {
         0xff, 0x06, 0xfe, 0x06, 0x10, 0xa3, 0x01, 0x4a, 0x06, 0xa3, 0x01, 0x4a, 0x07, 0xa3, 0x01, 0x4a,
         0x03, 0xa3, 0x01, 0x4a, 0x04, 0x2c, 0x10, 0xa3, 0x01, 0x4a, 0x03, 0xa3, 0x01, 0x4a, 0x04, 0xa3,
         0x01, 0x4a, 0x06, 0xa3, 0x01, 0x4a, 0x07, 0x2e, 0x01, 0x08, 0xff
+    ];
+
+    static ACK_LEASE_TIME_BYTES: &[u8] = &[
+        0x02, 0x01, 0x06, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x0a, 0x22, 0x10, 0x0b, 0x0a, 0x22, 0x10, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x04, 0x91, 0x62, 0xd2,
+        0xa8, 0x6f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x63, 0x82, 0x53, 0x63,
+        0x35, 0x01, 0x05, 0x36, 0x04, 0x0a, 0x22, 0x10, 0x0a, 0x33, 0x04, 0x00, 0x00, 0x02, 0x56, 0x01,
+        0x04, 0xff, 0xff, 0xff, 0x00, 0x03, 0x04, 0x0a, 0x22, 0x10, 0x0a, 0xff, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     ];
 
     const IP_NULL: Ipv4Address = Ipv4Address([0, 0, 0, 0]);
@@ -952,14 +1002,14 @@ mod test {
 
         {
             let mut options = packet.options_mut().unwrap();
-            let tmp = options; options = DhcpOption::MessageType(MessageType::Discover).emit(tmp);
-            let tmp = options; options = DhcpOption::ClientIdentifier(CLIENT_MAC).emit(tmp);
-            let tmp = options; options = DhcpOption::RequestedIp(IP_NULL).emit(tmp);
-            let tmp = options; options = DhcpOption::MaximumDhcpMessageSize(DHCP_SIZE).emit(tmp);
+            options = DhcpOption::MessageType(MessageType::Discover).emit(options);
+            options = DhcpOption::ClientIdentifier(CLIENT_MAC).emit(options);
+            options = DhcpOption::RequestedIp(IP_NULL).emit(options);
+            options = DhcpOption::MaximumDhcpMessageSize(DHCP_SIZE).emit(options);
             let option = DhcpOption::Other {
                 kind: field::OPT_PARAMETER_REQUEST_LIST, data: &[1, 3, 6, 42],
             };
-            let tmp = options; options = option.emit(tmp);
+            options = option.emit(options);
             DhcpOption::EndOfList.emit(options);
         }
 
@@ -969,6 +1019,28 @@ mod test {
         }
 
         assert_eq!(packet, DISCOVER_BYTES);
+    }
+
+    fn offer_repr() -> Repr<'static> {
+        Repr {
+            message_type: MessageType::Offer,
+            transaction_id: 0x3d1d,
+            client_hardware_address: CLIENT_MAC,
+            client_ip: IP_NULL,
+            your_ip: IP_NULL,
+            server_ip: IP_NULL,
+            router: Some(IP_NULL),
+            subnet_mask: Some(IP_NULL),
+            relay_agent_ip: IP_NULL,
+            broadcast: false,
+            requested_ip: None,
+            client_identifier: Some(CLIENT_MAC),
+            server_identifier: None,
+            parameter_request_list: None,
+            dns_servers: None,
+            max_size: None,
+            lease_duration: Some(0xffff_ffff), // Infinite lease
+        }
     }
 
     fn discover_repr() -> Repr<'static> {
@@ -984,6 +1056,7 @@ mod test {
             relay_agent_ip: IP_NULL,
             broadcast: false,
             max_size: Some(DHCP_SIZE),
+            lease_duration: None,
             requested_ip: Some(IP_NULL),
             client_identifier: Some(CLIENT_MAC),
             server_identifier: None,
@@ -1014,6 +1087,14 @@ mod test {
     }
 
     #[test]
+    fn test_emit_offer() {
+        let repr = offer_repr();
+        let mut bytes = vec![0xa5; repr.buffer_len()];
+        let mut packet = Packet::new_unchecked(&mut bytes);
+        repr.emit(&mut packet).unwrap();
+    }
+
+    #[test]
     fn test_emit_dhcp_option() {
         static DATA: &[u8] = &[1, 3, 6];
         let mut bytes = vec![0xa5; 5];
@@ -1031,8 +1112,9 @@ mod test {
 
     #[test]
     fn test_parse_ack_dns_servers() {
-        let packet = Packet::new_unchecked(ACK_BYTES);
+        let packet = Packet::new_unchecked(ACK_DNS_SERVER_BYTES);
         let repr = Repr::parse(&packet).unwrap();
+
         // The packet described by ACK_BYTES advertises 4 DNS servers
         // Here we ensure that we correctly parse the first 3 into our fixed
         // length-3 array (see issue #305)
@@ -1040,5 +1122,15 @@ mod test {
             Some(Ipv4Address([163, 1, 74, 6])),
             Some(Ipv4Address([163, 1, 74, 7])),
             Some(Ipv4Address([163, 1, 74, 3]))]));
+    }
+
+    #[test]
+    fn test_parse_ack_lease_duration() {
+        let packet = Packet::new_unchecked(ACK_LEASE_TIME_BYTES);
+        let repr = Repr::parse(&packet).unwrap();
+
+        // Verify that the lease time in the ACK is properly parsed. The packet contains a lease
+        // duration of 598s.
+        assert_eq!(repr.lease_duration, Some(598));
     }
 }

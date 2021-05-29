@@ -6,12 +6,12 @@ use crate::phy::ChecksumCapabilities;
 use crate::wire::ip::checksum;
 use crate::wire::{IpAddress, IpProtocol, Ipv6Packet, Ipv6Repr};
 use crate::wire::MldRepr;
-#[cfg(feature = "ethernet")]
+#[cfg(feature = "medium-ethernet")]
 use crate::wire::NdiscRepr;
 
 enum_with_unknown! {
     /// Internet protocol control message type.
-    pub doc enum Message(u8) {
+    pub enum Message(u8) {
         /// Destination Unreachable.
         DstUnreachable  = 0x01,
         /// Packet Too Big.
@@ -98,7 +98,7 @@ impl fmt::Display for Message {
 
 enum_with_unknown! {
     /// Internet protocol control message subtype for type "Destination Unreachable".
-    pub doc enum DstUnreachable(u8) {
+    pub enum DstUnreachable(u8) {
         /// No Route to destination.
         NoRoute         = 0,
         /// Communication with destination administratively prohibited.
@@ -141,7 +141,7 @@ impl fmt::Display for DstUnreachable {
 
 enum_with_unknown! {
     /// Internet protocol control message subtype for the type "Parameter Problem".
-    pub doc enum ParamProblem(u8) {
+    pub enum ParamProblem(u8) {
         /// Erroneous header field encountered.
         ErroneousHdrField  = 0,
         /// Unrecognized Next Header type encountered.
@@ -168,7 +168,7 @@ impl fmt::Display for ParamProblem {
 
 enum_with_unknown! {
     /// Internet protocol control message subtype for the type "Time Exceeded".
-    pub doc enum TimeExceeded(u8) {
+    pub enum TimeExceeded(u8) {
         /// Hop limit exceeded in transit.
         HopLimitExceeded    = 0,
         /// Fragment reassembly time exceeded.
@@ -191,6 +191,7 @@ impl fmt::Display for TimeExceeded {
 
 /// A read/write wrapper around an Internet Control Message Protocol version 6 packet buffer.
 #[derive(Debug, PartialEq, Clone)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Packet<T: AsRef<[u8]>> {
     pub(super) buffer: T
 }
@@ -503,6 +504,7 @@ impl<T: AsRef<[u8]>> AsRef<[u8]> for Packet<T> {
 
 /// A high-level representation of an Internet Control Message Protocol version 6 packet header.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum Repr<'a> {
     DstUnreachable {
@@ -536,7 +538,7 @@ pub enum Repr<'a> {
         seq_no: u16,
         data:   &'a [u8]
     },
-    #[cfg(feature = "ethernet")]
+    #[cfg(feature = "medium-ethernet")]
     Ndisc(NdiscRepr<'a>),
     Mld(MldRepr<'a>),
 }
@@ -617,7 +619,7 @@ impl<'a> Repr<'a> {
                     data:   packet.payload()
                 })
             },
-            #[cfg(feature = "ethernet")]
+            #[cfg(feature = "medium-ethernet")]
             (msg_type, 0) if msg_type.is_ndisc() => {
                 NdiscRepr::parse(packet).map(Repr::Ndisc)
             },
@@ -639,7 +641,7 @@ impl<'a> Repr<'a> {
             &Repr::EchoReply { data, .. } => {
                 field::ECHO_SEQNO.end + data.len()
             },
-            #[cfg(feature = "ethernet")]
+            #[cfg(feature = "medium-ethernet")]
             &Repr::Ndisc(ndisc) => {
                 ndisc.buffer_len()
             },
@@ -710,7 +712,7 @@ impl<'a> Repr<'a> {
                 packet.payload_mut()[..data_len].copy_from_slice(&data[..data_len])
             },
 
-            #[cfg(feature = "ethernet")]
+            #[cfg(feature = "medium-ethernet")]
             Repr::Ndisc(ndisc) => {
                 ndisc.emit(packet)
             },

@@ -77,9 +77,9 @@ mod field {
 
 pub mod pretty_print;
 
-#[cfg(feature = "ethernet")]
+#[cfg(feature = "medium-ethernet")]
 mod ethernet;
-#[cfg(all(feature = "proto-ipv4", feature = "ethernet"))]
+#[cfg(all(feature = "proto-ipv4", feature = "medium-ethernet"))]
 mod arp;
 pub(crate) mod ip;
 #[cfg(feature = "proto-ipv4")]
@@ -102,9 +102,9 @@ mod icmpv6;
 mod icmp;
 #[cfg(feature = "proto-igmp")]
 mod igmp;
-#[cfg(all(feature = "proto-ipv6", feature = "ethernet"))]
+#[cfg(all(feature = "proto-ipv6", feature = "medium-ethernet"))]
 mod ndisc;
-#[cfg(all(feature = "proto-ipv6", feature = "ethernet"))]
+#[cfg(all(feature = "proto-ipv6", feature = "medium-ethernet"))]
 mod ndiscoption;
 #[cfg(feature = "proto-ipv6")]
 mod mld;
@@ -115,14 +115,14 @@ pub(crate) mod dhcpv4;
 
 pub use self::pretty_print::PrettyPrinter;
 
-#[cfg(feature = "ethernet")]
+#[cfg(feature = "medium-ethernet")]
 pub use self::ethernet::{EtherType as EthernetProtocol,
                          Address as EthernetAddress,
                          Frame as EthernetFrame,
                          HEADER_LEN as ETHERNET_HEADER_LEN,
                          Repr as EthernetRepr};
 
-#[cfg(all(feature = "proto-ipv4", feature = "ethernet"))]
+#[cfg(all(feature = "proto-ipv4", feature = "medium-ethernet"))]
 pub use self::arp::{Hardware as ArpHardware,
                     Operation as ArpOperation,
                     Packet as ArpPacket,
@@ -193,12 +193,12 @@ pub use self::icmpv6::{Message as Icmpv6Message,
 pub use self::icmp::Repr as IcmpRepr;
 
 
-#[cfg(all(feature = "proto-ipv6", feature = "ethernet"))]
+#[cfg(all(feature = "proto-ipv6", feature = "medium-ethernet"))]
 pub use self::ndisc::{Repr as NdiscRepr,
                       RouterFlags as NdiscRouterFlags,
                       NeighborFlags as NdiscNeighborFlags};
 
-#[cfg(all(feature = "proto-ipv6", feature = "ethernet"))]
+#[cfg(all(feature = "proto-ipv6", feature = "medium-ethernet"))]
 pub use self::ndiscoption::{NdiscOption,
                             Repr as NdiscOptionRepr,
                             Type as NdiscOptionType,
@@ -211,7 +211,8 @@ pub use self::mld::{AddressRecord as MldAddressRecord,
                     Repr as MldRepr};
 
 pub use self::udp::{Packet as UdpPacket,
-                    Repr as UdpRepr};
+                    Repr as UdpRepr,
+                    HEADER_LEN as UDP_HEADER_LEN};
 
 pub use self::tcp::{SeqNumber as TcpSeqNumber,
                     Packet as TcpPacket,
@@ -222,4 +223,7 @@ pub use self::tcp::{SeqNumber as TcpSeqNumber,
 #[cfg(feature = "proto-dhcpv4")]
 pub use self::dhcpv4::{Packet as DhcpPacket,
                        Repr as DhcpRepr,
-                       MessageType as DhcpMessageType};
+                       MessageType as DhcpMessageType,
+                       CLIENT_PORT as DHCP_CLIENT_PORT,
+                       SERVER_PORT as DHCP_SERVER_PORT,
+                       MAX_DNS_SERVER_COUNT as DHCP_MAX_DNS_SERVER_COUNT};

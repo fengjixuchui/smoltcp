@@ -3,23 +3,24 @@ mod utils;
 
 use std::collections::BTreeMap;
 use std::os::unix::io::AsRawFd;
-use smoltcp::phy::wait as phy_wait;
+use log::*;
+
+use smoltcp::{phy::{Device, Medium, wait as phy_wait}, time::Duration};
 use smoltcp::wire::{EthernetAddress, Ipv4Address, IpCidr, Ipv4Cidr};
-use smoltcp::iface::{NeighborCache, EthernetInterfaceBuilder, Routes};
-use smoltcp::socket::{SocketSet, RawSocketBuffer, RawPacketMetadata};
+use smoltcp::iface::{NeighborCache, InterfaceBuilder, Interface, Routes};
+use smoltcp::socket::{SocketSet, Dhcpv4Socket, Dhcpv4Event};
 use smoltcp::time::Instant;
-use smoltcp::dhcp::Dhcpv4Client;
 
 fn main() {
     #[cfg(feature = "log")]
     utils::setup_logging("");
 
     let (mut opts, mut free) = utils::create_options();
-    utils::add_tap_options(&mut opts, &mut free);
+    utils::add_tuntap_options(&mut opts, &mut free);
     utils::add_middleware_options(&mut opts, &mut free);
 
     let mut matches = utils::parse_options(&opts, free);
-    let device = utils::parse_tap_options(&mut matches);
+    let device = utils::parse_tuntap_options(&mut matches);
     let fd = device.as_raw_fd();
     let device = utils::parse_middleware_options(&mut matches, device, /*loopback=*/false);
 
@@ -28,73 +29,74 @@ fn main() {
     let ip_addrs = [IpCidr::new(Ipv4Address::UNSPECIFIED.into(), 0)];
     let mut routes_storage = [None; 1];
     let routes = Routes::new(&mut routes_storage[..]);
-    let mut iface = EthernetInterfaceBuilder::new(device)
-            .ethernet_addr(ethernet_addr)
-            .neighbor_cache(neighbor_cache)
+
+    let medium = device.capabilities().medium;
+    let mut builder = InterfaceBuilder::new(device)
             .ip_addrs(ip_addrs)
-            .routes(routes)
-            .finalize();
+            .routes(routes);
+    if medium == Medium::Ethernet {
+        builder = builder
+            .ethernet_addr(ethernet_addr)
+            .neighbor_cache(neighbor_cache);
+    }
+    let mut iface = builder.finalize();
 
     let mut sockets = SocketSet::new(vec![]);
-    let dhcp_rx_buffer = RawSocketBuffer::new(
-        [RawPacketMetadata::EMPTY; 1],
-        vec![0; 900]
-    );
-    let dhcp_tx_buffer = RawSocketBuffer::new(
-        [RawPacketMetadata::EMPTY; 1],
-        vec![0; 600]
-    );
-    let mut dhcp = Dhcpv4Client::new(&mut sockets, dhcp_rx_buffer, dhcp_tx_buffer, Instant::now());
-    let mut prev_cidr = Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0);
+    let mut dhcp_socket = Dhcpv4Socket::new();
+
+    // Set a ridiculously short max lease time to show DHCP renews work properly.
+    // This will cause the DHCP client to start renewing after 5 seconds, and give up the
+    // lease after 10 seconds if renew hasn't succeeded.
+    // IMPORTANT: This should be removed in production.
+    dhcp_socket.set_max_lease_duration(Some(Duration::from_secs(10)));
+
+    let dhcp_handle = sockets.add(dhcp_socket);
+
     loop {
         let timestamp = Instant::now();
-        iface.poll(&mut sockets, timestamp)
-            .map(|_| ())
-            .unwrap_or_else(|e| println!("Poll: {:?}", e));
-        let config = dhcp.poll(&mut iface, &mut sockets, timestamp)
-            .unwrap_or_else(|e| {
-                println!("DHCP: {:?}", e);
-                None
-            });
-        config.map(|config| {
-            println!("DHCP config: {:?}", config);
-            if let Some(cidr) = config.address {
-                if cidr != prev_cidr {
-                    iface.update_ip_addrs(|addrs| {
-                        addrs.iter_mut().next()
-                            .map(|addr| {
-                                *addr = IpCidr::Ipv4(cidr);
-                            });
-                    });
-                    prev_cidr = cidr;
-                    println!("Assigned a new IPv4 address: {}", cidr);
+        if let Err(e) = iface.poll(&mut sockets, timestamp) {
+            debug!("poll error: {}", e);
+        }
+
+        match sockets.get::<Dhcpv4Socket>(dhcp_handle).poll() {
+            None => {}
+            Some(Dhcpv4Event::Configured(config)) => {
+                debug!("DHCP config acquired!");
+
+                debug!("IP address:      {}", config.address);
+                set_ipv4_addr(&mut iface, config.address);
+
+                if let Some(router) = config.router {
+                    debug!("Default gateway: {}", router);
+                    iface.routes_mut().add_default_ipv4_route(router).unwrap();
+                } else {
+                    debug!("Default gateway: None");
+                    iface.routes_mut().remove_default_ipv4_route();
+                }
+
+                for (i, s) in config.dns_servers.iter().enumerate() {
+                    if let Some(s) = s {
+                        debug!("DNS server {}:    {}", i, s);
+                    }
                 }
             }
-
-            config.router.map(|router| iface.routes_mut()
-                              .add_default_ipv4_route(router)
-                              .unwrap()
-            );
-            iface.routes_mut()
-                .update(|routes_map| {
-                    routes_map.get(&IpCidr::new(Ipv4Address::UNSPECIFIED.into(), 0))
-                        .map(|default_route| {
-                            println!("Default gateway: {}", default_route.via_router);
-                        });
-                });
-
-            if config.dns_servers.iter().any(|s| s.is_some()) {
-                println!("DNS servers:");
-                for dns_server in config.dns_servers.iter().filter_map(|s| *s) {
-                    println!("- {}", dns_server);
-                }
+            Some(Dhcpv4Event::Deconfigured) => {
+                debug!("DHCP lost config!");
+                set_ipv4_addr(&mut iface, Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0));
+                iface.routes_mut().remove_default_ipv4_route();
             }
-        });
+        }
 
-        let mut timeout = dhcp.next_poll(timestamp);
-        iface.poll_delay(&sockets, timestamp)
-            .map(|sockets_timeout| timeout = sockets_timeout);
-        phy_wait(fd, Some(timeout))
-            .unwrap_or_else(|e| println!("Wait: {:?}", e));
+        phy_wait(fd, iface.poll_delay(&sockets, timestamp)).expect("wait error");
     }
 }
+
+fn set_ipv4_addr<DeviceT>(iface: &mut Interface<'_, DeviceT>, cidr: Ipv4Cidr)
+    where DeviceT: for<'d> Device<'d>
+{
+    iface.update_ip_addrs(|addrs| {
+        let dest = addrs.iter_mut().next().unwrap();
+        *dest = IpCidr::Ipv4(cidr);
+    });
+}
+

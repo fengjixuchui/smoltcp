@@ -3,7 +3,7 @@ use crate::{Error, Result};
 
 enum_with_unknown! {
     /// IPv6 Extension Header Option Type
-    pub doc enum Type(u8) {
+    pub enum Type(u8) {
         /// 1 byte of padding
         Pad1 =  0,
         /// Multiple bytes of padding
@@ -24,7 +24,7 @@ impl fmt::Display for Type {
 enum_with_unknown! {
     /// Action required when parsing the given IPv6 Extension
     /// Header Option Type fails
-    pub doc enum FailureType(u8) {
+    pub enum FailureType(u8) {
         /// Skip this option and continue processing the packet
         Skip               = 0b00000000,
         /// Discard the containing packet
@@ -58,6 +58,7 @@ impl From<Type> for FailureType {
 
 /// A read/write wrapper around an IPv6 Extension Header Option.
 #[derive(Debug, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Ipv6Option<T: AsRef<[u8]>> {
     buffer: T
 }
@@ -214,6 +215,7 @@ impl<'a, T: AsRef<[u8]> + ?Sized> fmt::Display for Ipv6Option<&'a T> {
 
 /// A high-level representation of an IPv6 Extension Header Option.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum Repr<'a> {
     Pad1,
@@ -278,6 +280,7 @@ impl<'a> Repr<'a> {
 
 /// A iterator for IPv6 options.
 #[derive(Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Ipv6OptionsIterator<'a> {
     pos: usize,
     length: usize,

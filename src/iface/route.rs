@@ -11,6 +11,7 @@ use crate::wire::{Ipv6Address, Ipv6Cidr};
 
 /// A prefix of addresses that should be routed via a router
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Route {
     pub via_router: IpAddress,
     /// `None` means "forever".
@@ -103,6 +104,24 @@ impl<'a> Routes<'a> {
             Ok(route) => Ok(route),
             Err((_cidr, _route)) => Err(Error::Exhausted)
         }
+    }
+
+    /// Remove the default ipv4 gateway
+    ///
+    /// On success, returns the previous default route, if any.
+    #[cfg(feature = "proto-ipv4")]
+    pub fn remove_default_ipv4_route(&mut self) -> Option<Route> {
+        let cidr = IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0);
+        self.storage.remove(&cidr)
+    }
+
+    /// Remove the default ipv6 gateway
+    ///
+    /// On success, returns the previous default route, if any.
+    #[cfg(feature = "proto-ipv6")]
+    pub fn remove_default_ipv6_route(&mut self) -> Option<Route> {
+        let cidr = IpCidr::new(IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 0), 0);
+        self.storage.remove(&cidr)
     }
 
     pub(crate) fn lookup(&self, addr: &IpAddress, timestamp: Instant) ->
